@@ -1,16 +1,14 @@
 # Multinational evaluation of AnthropoAge as a measure of biological age
 # in the USA, England, Mexico, Costa Rica, and China:
 # a population-based longitudinal study
+
 ## Data Analysis: Carlos Alberto Fermin-Martinez & Omar Yaxmehen Bello-Chavolla
-## Latest version of Analysis: May 2024
+## Latest version of Analysis: January 2025
 ## For any question regarding analysis contact:
 ## Omar Yaxmehen Bello-Chavolla at oyaxbell@yahoo.com.mx
 
-#PENDIENTES:
-#5. OUTCOMES ADICIONALES EN LAS VARIABLES EN LAS QUE SEA POSIBLE... ¿TELOMERE LENGHT? ¿LABS? ¿PHENOAGE?
-
 ####-------------------------------- DATABASES --------------------#### ----####
-#Preparation----- ####
+#Preparation------ ####
 ### Working directory ###
 wd.CAFM <- paste0( #CAFM working directory
   "~/OneDrive - UNIVERSIDAD NACIONAL AUTÓNOMA DE MÉXICO/",
@@ -30,13 +28,15 @@ set_existing_wd(c(wd.OYBC,wd.CAFM))
 ### Packages ###
 #devtools::install_github("davidsjoberg/ggsankey")
 #remotes::install_github("chainsawriot/hongkong")
+#devtools::install_github("kunhuo/plotRCS")
 pacman::p_load(tidyverse, survival, haven, flexsurv, survey,   flextable,
                ggpubr,blandr, BlandAltmanLeh, jtools,ggsankey, patchwork,
                sjmisc, pROC, gsubfn, lubridate, gridExtra, ggpubr, furrr,
                OptimalCutpoints, timeROC, lme4, lmerTest, coxme, geepack,
                weights, officer, riskRegression, compareC, parallel, gee,
                ggalluvial, devtools, gtools,foreach,doParallel,coxme,rms,
-               iterators, measurements, survminer, gtsummary, data.table)
+               iterators, measurements, survminer, gtsummary, data.table,
+               dcurves)
 
 ### Race/ethnicity coding ###
 race_ethnicity1 <- c(
@@ -179,10 +179,18 @@ nrowf2 <- function(x){nrow(x) %>% format(big.mark = ",")}
 #model8 %>% get %>% coefficients %>% round(5) #Women
 
 
-#HRS------------- ####
+#HRS-------------- ####
 ## HRS ## -- 15 Waves: 1992-2020 (biennially)
 ## S-AnthropoAge can only be calculated in W8-W14 (2006,08,10,12,14,16,18)
 HRS_alt <- readRDS("Databases/randhrs1992_2020v1.rds.gz")
+
+HRS_alt$R8IWSTAT %>% table
+HRS_alt$R9IWSTAT %>% table
+HRS_alt$R10IWSTAT %>% table
+HRS_alt$R11IWSTAT %>% table
+HRS_alt$R12IWSTAT %>% table
+HRS_alt$R13IWSTAT %>% table
+HRS_alt$R14IWSTAT %>% table
 
 #Way too heavy:
 #HRS_h <- readRDS("Databases/HRS/H_HRS_d.rds.gz")
@@ -194,10 +202,13 @@ HRS_alt <- readRDS("Databases/randhrs1992_2020v1.rds.gz")
 #Harmonized HRS to obtain demographics and lifestyle data
 HRS_h_var <- readRDS("Databases/HRS/HRS_h_var.rds.gz") %>% 
   `names<-`(c("HHIDPN","raeducl", paste0("R",8:14,"SMOKEF")))
-HRS_alt <- dplyr::bind_cols(HRS_alt, HRS_h_var[-1])
+HRS_alt <- dplyr::bind_cols(HRS_alt, HRS_h_var[-1]); remove(HRS_h_var)
+#Include only waves 8-14
+HRS_fin <- HRS_alt %>% filter(
+  (INW8==1|INW9==1|INW10==1|INW11==1|INW12==1|INW13==1|INW14==1))
 
 # Select variables and change to long format
-HRS.A1.0 <- HRS_alt %>% select(
+HRS.A1.0 <- HRS_fin %>% select(
   HHIDPN, RAGENDER, RARACEM, RAHISPAN, raeducl, RADMONTH, RADYEAR,
   R15IWSTAT, HACOHORT, all_of(paste0("INW",8:14)),
   (8:14 %>% sapply(gsub, pattern="@", x=c(
@@ -253,12 +264,49 @@ HRS.A1_W <- HRS.A1_W %>% mutate("E.DATE" = ifelse(
   mortstat2==0|is.na(D.DATE), as.character(LAST.IW),
   as.character(D.DATE)) %>% as.Date)
 
+# Adiposity indices
+#A Body Shape Index (ABSI)
+HRS.A1_W$ABSI <- with(
+  HRS.A1_W,(Waist*10)*(Weight)^(-2/3)*(Height/100)^(5/6)) 
+#Weight-adjusted-waist index (WWI) 
+HRS.A1_W$WWI <- with(HRS.A1_W, Waist/sqrt(Weight)) 
+#Body Roundness Index (BRI)
+#BRI formula = 365.2 − 365.5 * (1 − (wc/2π)^2/(0.5 × height)^2)^(1/2)
+HRS.A1_W$BRI <- with(
+  HRS.A1_W, 365.2-365.5*sqrt(1-((Waist/(2*pi))^2)/((0.5*(Height))^2))) 
+
+# Education and lifestyle
+#Education
+HRS.A1_W$Education <- HRS.A1_W$raeducl %>%
+  factor(1:3, c("Primary or less", "Secondary", "Tertiary"))
+#Smoking
+HRS.A1_W$Smoking <- HRS.A1_W %>% with(case_when(
+  SMOKEV==0~0, SMOKEN==0~1, SMOKEF<10~2, SMOKEF>=10~3)) %>%
+  factor(0:3, c("Never smoker","Former smoker","<10/day",">=10/day"))
+#Drinking
+HRS.A1_W$Drinking <- HRS.A1_W %>% with(case_when(
+  DRINK==0~0, DRINKD==0~1, DRINKD%in%1:6~2, DRINKD>=7~3)) %>%
+  factor(0:3, c("Never","Less than weekly","Less than daily","Daily"))
+#Frequent physical activity (>1/week)
+HRS.A1_W$VigPA1 <- with(HRS.A1_W, case_when(VGACTX%in%3:5~0, VGACTX%in%1:2~1))
+HRS.A1_W$VigPA2 <- HRS.A1_W$VigPA1 %>% factor(0:1, c("No","Yes"))
+
+# Number of comorbidities
+corrNA <- function(x){ifelse(x%in%0:1,x,NA)}; HRS.A1_W<-HRS.A1_W%>%mutate(
+  "HBP"=corrNA(HBP), "T2D"=corrNA(T2D), "CAN"=corrNA(CAN), "LUD"=corrNA(LUD),
+  "AMI"=corrNA(AMI), "EVC"=corrNA(EVC), "ART"=corrNA(ART))
+HRS.A1_W$n_comorb <- with(HRS.A1_W, HBP+T2D+CAN+LUD+AMI+EVC+ART)
+HRS.A1_W$comorb_cat <- cut(HRS.A1_W$n_comorb, breaks=c(-Inf,0,1,Inf)) %>%
+  ordered(labels=c("0","1",">=2"))
+
+# Time to death in months + country specific race/ethnicity
+HRS.A1_W <- HRS.A1_W %>%
+  mutate("TTDM"=interval(start=B.DATE,end=E.DATE) %/% months(1),
+         "Ethnicity2"=factor(Ethnicity, levels=race_ethnicity1,
+                             labels=paste0("US-",race_ethnicity1)))
+
 # Filters
 HRS.A1 <- HRS.A1_W %>%
-  mutate( #Time to death in months + country specific race/ethnicity
-    "TTDM"=interval(start=B.DATE,end=E.DATE) %/% months(1),
-    "Ethnicity2"=factor(Ethnicity, levels=race_ethnicity1,
-                        labels=paste0("US-",race_ethnicity1))) %>%
   filter( #Complete follow-up data (≥0 months)
     TTDM>=0|is.na(TTDM)) %>% filter(!is.na(coh)) %>%
   filter( #Complete AnthropoAge (non-infinite) and mortality data
@@ -268,35 +316,81 @@ HRS.A1 <- HRS.A1_W %>%
     Age>=50, Age<90, AnthropoAge>=10, Height>=125, Height<=200,
     Weight>=30, Weight<=150, Waist>=50, Waist<=160, BMI>=15, BMI<=60)
 
-# Education and lifestyle
-#Education
-HRS.A1$Education <- HRS.A1$raeducl %>%
-  factor(1:3, c("Primary or less", "Secondary", "Tertiary"))
-#Smoking
-HRS.A1$Smoking <- HRS.A1 %>% with(case_when(
-  SMOKEV==0~0, SMOKEN==0~1, SMOKEF<10~2, SMOKEF>=10~3)) %>%
-  factor(0:3, c("Never smoker","Former smoker","<10/day",">=10/day"))
-#Drinking
-HRS.A1$Drinking <- HRS.A1 %>% with(case_when(
-  DRINK==0~0, DRINKD==0~1, DRINKD%in%1:6~2, DRINKD>=7~3)) %>%
-  factor(0:3, c("Never","Less than weekly","Less than daily","Daily"))
-#Frequent physical activity (>1/week)
-HRS.A1$VigPA1 <- with(HRS.A1, case_when(VGACTX%in%3:5~0, VGACTX%in%1:2~1))
-HRS.A1$VigPA2 <- HRS.A1$VigPA1 %>% factor(0:1, c("No","Yes"))
-
 # Set different baselines
 HRS.A1_B1 <- HRS.A1 %>% filter(wave==8&INW8==1) %>%
   filter(!duplicated(ID)) #Only 2006 + remove follow-ups
-HRS.A1_BX <- HRS.A1 %>% filter(!duplicated(ID)) #Remove follow-ups
+HRS.A1_BX <- HRS.A1 %>% filter(!duplicated(ID)) #Remove follow-ups (included)
+HRS.remov <- HRS.A1_W[!(HRS.A1_W$ID %in% HRS.A1$ID),] %>%
+  filter(!duplicated(ID)) #Remove follow-ups (NOT included)
+
+## Included vs not included table ##
+HRS.A1_BX$inc_rem <- "Included"; HRS.remov$inc_rem <- "Not included"
+HRS_tab <- rbind(HRS.A1_BX, HRS.remov) %>% transmute(
+  inc_rem, Age, "Sex"=ifelse(Sex=="Women",1,0), Ethnicity,
+  "Education"=ifelse(Education=="Primary or less",1,0),
+  BMI, ICE, AnthropoAge, Smoking, Drinking, VigPA1, ADL, IADL, SRH, T2D, HBP,
+  AMI, CAN, LUD, EVC, ART, comorb_cat, mortstat2, "TTDY"=TTDM/12) %>% mutate(
+    "T2D"=case_when(T2D==1~1, T2D==0~0), "HBP"=case_when(HBP==1~1, HBP==0~0),
+    "AMI"=case_when(AMI==1~1, AMI==0~0), "CAN"=case_when(CAN==1~1, CAN==0~0),
+    "LUD"=case_when(LUD==1~1, LUD==0~0), "EVC"=case_when(EVC==1~1, EVC==0~0),
+    "ART"=case_when(ART==1~1, ART==0~0),
+    "Drinking"=ifelse(Drinking=="Never",0,1),
+    "Smoking"=ifelse(Smoking%in%c("Never smoker", "Former smoker"),0,1),
+    "comorb_cat"=ifelse(comorb_cat==">=2",1,0), "ADL"=ifelse(ADL==0,0,1),
+    "IADL"=ifelse(IADL==0,0,1), "SRH"=case_when(SRH%in%1:5~as.numeric(SRH)))
+
+#Set labels
+labs1 <- names(HRS_tab)[-1]; nlab <- labs1 %>% length
+labs2 <- c(
+  "Age (years)", "Women (%)", "Race/ethnicity (%)",
+  "Primary or less education (%)",
+  "BMI (kg/m^2)", "WHtR", "AnthropoAge (years)", "Current smoker (%)",
+  "Current alcohol intake (%)", "Frequent vigorous activity (%)",
+  "≥1 ADL deficit (%)", "≥1 IADL deficit (%)", "Self-reported health",
+  "Diabetes mellitus (%)","Arterial hypertension (%)",
+  "Myocardial infarction (%)","Cancer (%)", "Chronic lung disease (%)",
+  "Stroke (%)","Arthritis (%)", "Multimorbidity (%)",
+  "Number of deahts (%)", "Follow-up time (years)")
+for(i in 1:nlab){with(HRS_tab, setattr(get(labs1[i]), "label", labs2[i]))}
+
+#Create table
+tab_HRS <- tbl_summary(HRS_tab, by=inc_rem, missing = "always",
+                       missing_text = "Missing",
+                       type=list(SRH ~ "continuous")) %>%
+  add_p() %>% bold_labels() %>% add_overall() %>%
+  as_flex_table() %>% align(align = "center",part = "all") %>% autofit()
+
+## Population flowchart ##
+# Number of participants
+HRS_n1 <- HRS_alt %>% nrowf2
+HRS_n2 <- HRS_fin %>% nrowf2
+HRS_n3 <- HRS.A1_W %>% filter( 
+  !is.na(AnthropoAge), !is.na(mortstat2), !is.na(WTRESP), WTRESP!=0) %>%
+  filter(!duplicated(ID)) %>%  nrowf2
+HRS_n4 <- HRS.A1 %>% filter(!duplicated(ID)) %>% nrowf2
+# Number of visits
+HRS_v1 <- nrowf2(HRS_alt %>% select((1:15 %>% sapply(
+  gsub, pattern="@", x=c("R@AGEY_E")) %>% as.character)) %>% pivot_longer(
+    cols=1:15,names_to=c("wave",".value"),names_pattern="^R(\\d)(.*)"))
+HRS_v2 <- nrowf2(HRS_fin %>% select((8:14 %>% sapply(
+  gsub, pattern="@", x=c("R@AGEY_E")) %>% as.character)) %>% pivot_longer(
+    cols=1:7,names_to=c("wave",".value"),names_pattern="^R(\\d)(.*)"))
+HRS_v3 <- HRS.A1_W %>% filter(!is.na(AnthropoAge), !is.na(mortstat2),
+                    !is.na(WTRESP), WTRESP!=0) %>%  nrowf2
+HRS_v4 <- HRS.A1 %>% nrowf2
+# Remove to save disk memory
+remove(HRS_alt, HRS_fin, HRS.A1_W, HRS.A1.0, HRS.remov, HRS_tab)
 
 
-#ELSA------------ ####
+#ELSA------------- ####
 ## ELSA --- 9 Waves: 2002-2018 (biennially)
 ## S-AnthropoAge can be calculated in W2,4,6 (2004, 2008, 2012)
-ELSA <- readRDS("Databases/h_elsa_g2.rds.gz")
+ELSA_full <- readRDS("Databases/h_elsa_g2.rds.gz")
+# Include only waves 2, 4, 6
+ELSA_fin <- ELSA_full %>% filter((inw2==1|inw4==1|inw6==1))
 
 # Select variables and change to long format
-ELSA.A1.0 <- ELSA %>% select(
+ELSA.A1.0 <- ELSA_fin %>% select(
   idauniqc, ragender, raracem, raeducl, radyear, r6iwstat, inw2, inw4, inw6,
   (c(2:6) %>% sapply(gsub, pattern="@", x=c("r@iwindm","r@iwindy")) %>%
      as.character), (c(2,4,6) %>% sapply(gsub, pattern="@", x=c(
@@ -356,43 +450,125 @@ ELSA.A1_W <- ELSA.A1_W %>% mutate("E.DATE" = ifelse(
   mortstat2==0|is.na(D.DATE), as.character(LAST.IW),
   as.character(D.DATE)) %>% as.Date)
 
-# Filters
-ELSA.A1 <- ELSA.A1_W %>%
-  mutate( #Time to death in months + country specific race/ethnicity
-    "TTDM"=interval(start=B.DATE,end=E.DATE) %/% months(1),
-    "Ethnicity2"=paste0("UK-",race_ethnicity1[1])) %>%
-  filter( #Complete follow-up data (≥0 months)
-  TTDM>=0|is.na(TTDM)) %>%
-  filter( #Complete AnthropoAge (non-infinite) and mortality data
-    !is.infinite(AnthropoAge), !is.na(AnthropoAge),
-    !is.na(cwtresp), cwtresp!=0) %>%
-  filter( #Age 50-90, anthropometry within original NHANES-III ranges
-    Age>=50, Age<90, AnthropoAge>=10, Height>=125, Height<=200,
-    Weight>=30, Weight<=150, Waist>=50, Waist<=160, BMI>=15, BMI<=60)
+# Adiposity indices
+#A Body Shape Index (ABSI)
+ELSA.A1_W$ABSI <- with(
+  ELSA.A1_W,(Waist*10)*(Weight)^(-2/3)*(Height/100)^(5/6)) 
+#Weight-adjusted-waist index (WWI) 
+ELSA.A1_W$WWI <- with(ELSA.A1_W, Waist/sqrt(Weight)) 
+#Body Roundness Index (BRI)
+#BRI formula = 365.2 − 365.5 * (1 − (wc/2π)^2/(0.5 × height)^2)^(1/2)
+ELSA.A1_W$BRI <- with(
+  ELSA.A1_W, 365.2-365.5*sqrt(1-((Waist/(2*pi))^2)/((0.5*(Height))^2))) 
 
 # Education and lifestyle
 #Education
-ELSA.A1$Education <- ELSA.A1$raeducl %>%
+ELSA.A1_W$Education <- ELSA.A1_W$raeducl %>%
   factor(1:3, c("Primary or less", "Secondary", "Tertiary"))
 #Smoking
-ELSA.A1$Smoking <- ELSA.A1 %>% with(case_when(
+ELSA.A1_W$Smoking <- ELSA.A1_W %>% with(case_when(
   smokev==0~0, smoken==0~1, smokef<10~2, smokef>=10~3)) %>%
   factor(0:3, c("Never smoker","Former smoker","<10/day",">=10/day"))
 #Drinking
-ELSA.A1$Drinking <- ELSA.A1 %>% with(case_when(
+ELSA.A1_W$Drinking <- ELSA.A1_W %>% with(case_when(
   drink==0~0, drinkd_e==0~1, drinkd_e%in%1:6~2, drinkd_e>=7~3)) %>%
   factor(0:3, c("Never","Less than weekly","Less than daily","Daily"))
 #Frequent physical activity (>1/week)
-ELSA.A1$VigPA1 <- with(ELSA.A1,case_when(vgactx_e%in%3:5~0,vgactx_e==2~1))
-ELSA.A1$VigPA2 <- ELSA.A1$VigPA1 %>% factor(0:1, c("No","Yes"))
+ELSA.A1_W$VigPA1 <- with(ELSA.A1_W,case_when(vgactx_e%in%3:5~0,vgactx_e==2~1))
+ELSA.A1_W$VigPA2 <- ELSA.A1_W$VigPA1 %>% factor(0:1, c("No","Yes"))
+
+# Number of comorbidities
+corrNA <- function(x){ifelse(x%in%0:1,x,NA)}; ELSA.A1_W<-ELSA.A1_W%>%mutate(
+  "HBP"=corrNA(HBP), "T2D"=corrNA(T2D), "CAN"=corrNA(CAN), "LUD"=corrNA(LUD),
+  "AMI"=corrNA(AMI), "EVC"=corrNA(EVC), "ART"=corrNA(ART))
+ELSA.A1_W$n_comorb <- with(ELSA.A1_W, HBP+T2D+CAN+LUD+AMI+EVC+ART)
+ELSA.A1_W$comorb_cat <- cut(ELSA.A1_W$n_comorb, breaks=c(-Inf,0,1,Inf)) %>%
+  ordered(labels=c("0","1",">=2"))
+
+# Time to death in months + country specific race/ethnicity
+ELSA.A1_W <- ELSA.A1_W %>%
+  mutate("TTDM"=interval(start=B.DATE,end=E.DATE) %/% months(1),
+         "Ethnicity2"=factor(Ethnicity, levels=race_ethnicity1,
+                             labels=paste0("UK-",race_ethnicity1)))
+
+# Filters
+ELSA.A1 <- ELSA.A1_W %>%
+  filter( #Complete follow-up data (≥0 months)
+    TTDM>=0|is.na(TTDM)) %>% filter(!is.na(coh)) %>%
+  filter( #Complete AnthropoAge (non-infinite) and mortality data
+    !is.infinite(AnthropoAge), !is.na(AnthropoAge),
+    !is.na(mortstat2), !is.na(cwtresp), cwtresp!=0) %>%
+  filter( #Age 50-90, anthropometry within original NHANES-III ranges
+    Age>=50, Age<90, AnthropoAge>=10, Height>=125, Height<=200,
+    Weight>=30, Weight<=150, Waist>=50, Waist<=160, BMI>=15, BMI<=60)
 
 # Set different baselines
 ELSA.A1_B1 <- ELSA.A1 %>% filter(wave==2&inw2==1) %>%
   filter(!duplicated(ID)) #Only 2004 + remove follow-ups
 ELSA.A1_BX <- ELSA.A1 %>% filter(!duplicated(ID)) #Remove follow-ups
+ELSA.remov <- ELSA.A1_W[!(ELSA.A1_W$ID %in% ELSA.A1$ID),] %>%
+  filter(!duplicated(ID)) #Remove follow-ups (NOT included)
+
+## Included vs not included table ##
+ELSA.A1_BX$inc_rem <- "Included"; ELSA.remov$inc_rem <- "Not included"
+ELSA_tab <- rbind(ELSA.A1_BX, ELSA.remov) %>% transmute(
+  inc_rem, Age, "Sex"=ifelse(Sex=="Women",1,0),
+  "Education"=ifelse(Education=="Primary or less",1,0),
+  BMI, ICE, AnthropoAge, Smoking, Drinking, VigPA1, ADL, IADL, SRH, T2D, HBP,
+  AMI, CAN, LUD, EVC, ART, comorb_cat, mortstat2, "TTDY"=TTDM/12) %>% mutate(
+    "T2D"=case_when(T2D==1~1, T2D==0~0), "HBP"=case_when(HBP==1~1, HBP==0~0),
+    "AMI"=case_when(AMI==1~1, AMI==0~0), "CAN"=case_when(CAN==1~1, CAN==0~0),
+    "LUD"=case_when(LUD==1~1, LUD==0~0), "EVC"=case_when(EVC==1~1, EVC==0~0),
+    "ART"=case_when(ART==1~1, ART==0~0),
+    "Drinking"=ifelse(Drinking=="Never",0,1),
+    "Smoking"=ifelse(Smoking%in%c("Never smoker", "Former smoker"),0,1),
+    "comorb_cat"=ifelse(comorb_cat==">=2",1,0), "ADL"=ifelse(ADL==0,0,1),
+    "IADL"=ifelse(IADL==0,0,1), "SRH"=case_when(SRH%in%1:5~as.numeric(SRH)))
+
+#Set labels
+labs1 <- names(ELSA_tab)[-1]; nlab <- labs1 %>% length
+labs2 <- c(
+  "Age (years)", "Women (%)", "Primary or less education (%)",
+  "BMI (kg/m^2)", "WHtR", "AnthropoAge (years)", "Current smoker (%)",
+  "Current alcohol intake (%)", "Frequent vigorous activity (%)",
+  "≥1 ADL deficit (%)", "≥1 IADL deficit (%)", "Self-reported health",
+  "Diabetes mellitus (%)","Arterial hypertension (%)",
+  "Myocardial infarction (%)","Cancer (%)", "Chronic lung disease (%)",
+  "Stroke (%)","Arthritis (%)", "Multimorbidity (%)",
+  "Number of deahts (%)", "Follow-up time (years)")
+for(i in 1:nlab){with(ELSA_tab, setattr(get(labs1[i]), "label", labs2[i]))}
+
+#Create table
+tab_ELSA <- tbl_summary(ELSA_tab, by=inc_rem, missing = "always",
+                        missing_text = "Missing",
+                       type=list(SRH ~ "continuous")) %>%
+  add_p() %>% bold_labels() %>% add_overall() %>%
+  as_flex_table() %>% align(align = "center",part = "all") %>% autofit()
 
 
-#MHAS------------ ####
+## Population flowchart ##
+# Number of participants
+ELSA_n1 <- ELSA_full %>% nrowf2
+ELSA_n2 <- ELSA_fin %>% nrowf2
+ELSA_n3 <- ELSA.A1_W %>% filter( 
+  !is.na(AnthropoAge), !is.na(mortstat2), !is.na(cwtresp), cwtresp!=0) %>%
+  filter(!duplicated(ID)) %>%  nrowf2
+ELSA_n4 <- ELSA.A1 %>% filter(!duplicated(ID)) %>% nrowf2
+# Number of visits
+ELSA_v1 <- nrowf2(ELSA_full %>% select((1:9 %>% sapply(
+  gsub, pattern="@", x=c("r@agey")) %>% as.character)) %>% pivot_longer(
+    cols=1:9,names_to=c("wave",".value"),names_pattern="^r(\\d)(.*)"))
+ELSA_v2 <- nrowf2(ELSA_fin %>% select((c(2,4,6) %>% sapply(
+  gsub, pattern="@", x=c("r@agey")) %>% as.character)) %>% pivot_longer(
+    cols=1:3,names_to=c("wave",".value"),names_pattern="^r(\\d)(.*)"))
+ELSA_v3 <- ELSA.A1_W %>% filter(!is.na(AnthropoAge), !is.na(mortstat2),
+                                !is.na(cwtresp), cwtresp!=0) %>%  nrowf2
+ELSA_v4 <- ELSA.A1 %>% nrowf2
+# Remove to save disk memory
+remove(ELSA_full, ELSA_fin, ELSA.A1_W, ELSA.A1.0, ELSA.remov, ELSA_tab)
+
+
+#MHAS------------- ####
 #Harmonized data
 MHAS <- readRDS("Databases/H_MHAS_c.rds.gz")
 
@@ -420,23 +596,26 @@ MHAS2021 <- rbind(
   MHAS2021.hc %>% select(unhhidnp, r6iwy, r6iwm, rady21, radm21, r6iwstat),
   MHAS2021.d %>% select(unhhidnp, r6iwy, r6iwm, rady21, radm21, r6iwstat))
 #Merge with harmonized data
-MHAS_fin <- MHAS %>% left_join(MHAS2021, by = "unhhidnp")
+MHAS_full <- MHAS %>% left_join(MHAS2021, by = "unhhidnp")
 #Interview status at wave 6
-MHAS_fin$r6iwstat <- with( #1=Respondent, alive
-  MHAS_fin, case_when(!is.na(r6iwstat)~r6iwstat, #5=Died this wave
+MHAS_full$r6iwstat <- with( #1=Respondent, alive
+  MHAS_full, case_when(!is.na(r6iwstat)~r6iwstat, #5=Died this wave
                       is.na(r6iwstat)&r5iwstat%in%5:6~6, #6=Died prev. wave
                       is.na(r6iwstat)&!r5iwstat%in%5:6~9)) #9=Unknown
 #Updated wave 6 interview year and month
-MHAS_fin$r6iwy <- (MHAS_fin$r6iwy %>% as.numeric)+2000
-MHAS_fin$r6iwm <- (MHAS_fin$r6iwm %>% as.numeric)
+MHAS_full$r6iwy <- (MHAS_full$r6iwy %>% as.numeric)+2000
+MHAS_full$r6iwm <- (MHAS_full$r6iwm %>% as.numeric)
 #Updated year and month of death
-MHAS_fin$radyear <- with(MHAS_fin, ifelse((!is.na(rady21)),rady21,radyear))
-MHAS_fin$radmonth <- with(MHAS_fin, ifelse((!is.na(radm21)),radm21,radmonth))
+MHAS_full$radyear <- with(MHAS_full, ifelse((!is.na(rady21)),rady21,radyear))
+MHAS_full$radmonth <- with(MHAS_full, ifelse((!is.na(radm21)),radm21,radmonth))
+# Include only waves 1-3
+MHAS_fin <- MHAS_full %>% filter((inw1==1|inw2==1|inw3==1))
+remove(MHAS2021, MHAS2021.d, MHAS2021.h, MHAS2021.c, MHAS2021.hc)
 
 # Select variables and change to long format
 MHAS.A1.0 <- MHAS_fin %>% select(
   unhhidnp, ragender, raeducl, radmonth, radyear,
-  hacohort, r6iwstat, inw1, inw2, inw3,
+  hacohort, inw1, inw2, inw3, r6iwstat,
   (1:6 %>% sapply(gsub, pattern="@", x=c("r@iwy","r@iwm")) %>% as.character),
   (1:3 %>% sapply(gsub, pattern="@", x=c(
     "r@agey", "r@mheight", "r@mweight", "r@mwaist", "r@shlt",
@@ -483,35 +662,57 @@ MHAS.A1_W <- MHAS.A1_W %>% mutate("E.DATE" = ifelse(
   mortstat2==0|is.na(D.DATE), as.character(LAST.IW),
   as.character(D.DATE)) %>% as.Date)
 
-# Filters
-MHAS.A1 <- MHAS.A1_W %>%
-  mutate( #Time to death in months + country specific race/ethnicity
-    "TTDM"=interval(start=B.DATE,end=E.DATE) %/% months(1),
-    "Ethnicity2"=paste0("MX-",race_ethnicity1[3])) %>%
-  filter( #Complete follow-up data (≥0 months)
-    wave%in%1:3) %>% filter(TTDM>=0|is.na(TTDM)) %>%
-  filter( #Complete AnthropoAge (non-infinite) and mortality data
-    !is.infinite(AnthropoAge), !is.na(AnthropoAge),
-    !is.na(mortstat2), !is.na(B.DATE), !is.na(wtresp), wtresp!=0) %>%
-  filter( #Age 50-90, anthropometry within original NHANES-III ranges
-    Age>=50, Age<90, AnthropoAge>=10, Height>=125, Height<=200,
-    Weight>=30, Weight<=150, Waist>=50, Waist<=160, BMI>=15, BMI<=60)
+# Adiposity indices
+#A Body Shape Index (ABSI)
+MHAS.A1_W$ABSI <- with(
+  MHAS.A1_W,(Waist*10)*(Weight)^(-2/3)*(Height/100)^(5/6)) 
+#Weight-adjusted-waist index (WWI) 
+MHAS.A1_W$WWI <- with(MHAS.A1_W, Waist/sqrt(Weight)) 
+#Body Roundness Index (BRI)
+#BRI formula = 365.2 − 365.5 * (1 − (wc/2π)^2/(0.5 × height)^2)^(1/2)
+MHAS.A1_W$BRI <- with(
+  MHAS.A1_W, 365.2-365.5*sqrt(1-((Waist/(2*pi))^2)/((0.5*(Height))^2))) 
 
 # Education and lifestyle
 #Education
-MHAS.A1$Education <- MHAS.A1$raeducl %>%
+MHAS.A1_W$Education <- MHAS.A1_W$raeducl %>%
   factor(1:3, c("Primary or less", "Secondary", "Tertiary"))
 #Smoking
-MHAS.A1$Smoking <- MHAS.A1 %>% with(case_when(
+MHAS.A1_W$Smoking <- MHAS.A1_W %>% with(case_when(
   smokev==0~0, smoken==0~1, smokef<10~2, smokef>=10~3)) %>%
   factor(0:3, c("Never smoker","Former smoker","<10/day",">=10/day"))
 #Drinking
-MHAS.A1$Drinking <- MHAS.A1 %>% with(case_when(
+MHAS.A1_W$Drinking <- MHAS.A1_W %>% with(case_when(
   drink==0~0, drinkd==0~1, drinkd%in%1:6~2, drinkd>=7~3)) %>%
   factor(0:3, c("Never","Less than weekly","Less than daily","Daily"))
 #Frequent physical activity (>1/week)
-MHAS.A1$VigPA1 <- with(MHAS.A1,case_when(vigact==0~0,vigact==1~1))
-MHAS.A1$VigPA2 <- MHAS.A1$VigPA1 %>% factor(0:1, c("No","Yes"))
+MHAS.A1_W$VigPA1 <- with(MHAS.A1_W,case_when(vigact==0~0,vigact==1~1))
+MHAS.A1_W$VigPA2 <- MHAS.A1_W$VigPA1 %>% factor(0:1, c("No","Yes"))
+
+# Number of comorbidities
+corrNA <- function(x){ifelse(x%in%0:1,x,NA)}; MHAS.A1_W<-MHAS.A1_W%>%mutate(
+  "HBP"=corrNA(HBP), "T2D"=corrNA(T2D), "CAN"=corrNA(CAN), "LUD"=corrNA(LUD),
+  "AMI"=corrNA(AMI), "EVC"=corrNA(EVC), "ART"=corrNA(ART))
+MHAS.A1_W$n_comorb <- with(MHAS.A1_W, HBP+T2D+CAN+LUD+AMI+EVC+ART)
+MHAS.A1_W$comorb_cat <- cut(MHAS.A1_W$n_comorb, breaks=c(-Inf,0,1,Inf)) %>%
+  ordered(labels=c("0","1",">=2"))
+
+# Time to death in months + country specific race/ethnicity
+MHAS.A1_W <- MHAS.A1_W %>%
+  mutate("TTDM"=interval(start=B.DATE,end=E.DATE) %/% months(1),
+         "Ethnicity2"=factor(Ethnicity, levels=race_ethnicity1,
+                             labels=paste0("MX-",race_ethnicity1)))
+
+# Filters
+MHAS.A1 <- MHAS.A1_W %>%
+  filter( #Complete follow-up data (≥0 months)
+    !is.na(TTDM), TTDM>=0) %>% filter(!is.na(coh)) %>%
+  filter( #Complete AnthropoAge (non-infinite) and mortality data
+    !is.infinite(AnthropoAge), !is.na(AnthropoAge),
+    !is.na(mortstat2), !is.na(wtresp), wtresp!=0) %>%
+  filter( #Age 50-90, anthropometry within original NHANES-III ranges
+    Age>=50, Age<90, AnthropoAge>=10, Height>=125, Height<=200,
+    Weight>=30, Weight<=150, Waist>=50, Waist<=160, BMI>=15, BMI<=60)
 
 # Set different baselines
 MHAS.A1_B1 <- MHAS.A1 %>% filter(wave==1&inw1==1) %>%
@@ -519,9 +720,68 @@ MHAS.A1_B1 <- MHAS.A1 %>% filter(wave==1&inw1==1) %>%
 MHAS.A1_B2 <- MHAS.A1 %>% filter(wave==3&inw3==1) %>%
   filter(!duplicated(ID)) #Only 2012 + remove follow-ups
 MHAS.A1_BX <- MHAS.A1 %>% filter(!duplicated(ID)) #Remove follow-ups
+MHAS.remov <- MHAS.A1_W[!(MHAS.A1_W$ID %in% MHAS.A1$ID),] %>%
+  filter(!duplicated(ID)) #Remove follow-ups (NOT included)
+
+## Included vs not included table ##
+MHAS.A1_BX$inc_rem <- "Included"; MHAS.remov$inc_rem <- "Not included"
+MHAS_tab <- rbind(MHAS.A1_BX, MHAS.remov) %>% transmute(
+  inc_rem, Age, "Sex"=ifelse(Sex=="Women",1,0),
+  "Education"=ifelse(Education=="Primary or less",1,0),
+  BMI, ICE, AnthropoAge, Smoking, Drinking, VigPA1, ADL, IADL, SRH, T2D, HBP,
+  AMI, CAN, LUD, EVC, ART, comorb_cat, mortstat2, "TTDY"=TTDM/12) %>% mutate(
+    "T2D"=case_when(T2D==1~1, T2D==0~0), "HBP"=case_when(HBP==1~1, HBP==0~0),
+    "AMI"=case_when(AMI==1~1, AMI==0~0), "CAN"=case_when(CAN==1~1, CAN==0~0),
+    "LUD"=case_when(LUD==1~1, LUD==0~0), "EVC"=case_when(EVC==1~1, EVC==0~0),
+    "ART"=case_when(ART==1~1, ART==0~0),
+    "Drinking"=ifelse(Drinking=="Never",0,1),
+    "Smoking"=ifelse(Smoking%in%c("Never smoker", "Former smoker"),0,1),
+    "comorb_cat"=ifelse(comorb_cat==">=2",1,0), "ADL"=ifelse(ADL==0,0,1),
+    "IADL"=ifelse(IADL==0,0,1), "SRH"=case_when(SRH%in%1:5~as.numeric(SRH)))
+
+#Set labels
+labs1 <- names(MHAS_tab)[-1]; nlab <- labs1 %>% length
+labs2 <- c(
+  "Age (years)", "Women (%)", "Primary or less education (%)",
+  "BMI (kg/m^2)", "WHtR", "AnthropoAge (years)", "Current smoker (%)",
+  "Current alcohol intake (%)", "Frequent vigorous activity (%)",
+  "≥1 ADL deficit (%)", "≥1 IADL deficit (%)", "Self-reported health",
+  "Diabetes mellitus (%)","Arterial hypertension (%)",
+  "Myocardial infarction (%)","Cancer (%)", "Chronic lung disease (%)",
+  "Stroke (%)","Arthritis (%)", "Multimorbidity (%)",
+  "Number of deahts (%)", "Follow-up time (years)")
+for(i in 1:nlab){with(MHAS_tab, setattr(get(labs1[i]), "label", labs2[i]))}
+
+#Create table
+tab_MHAS <- tbl_summary(MHAS_tab, by=inc_rem, missing = "always",
+                        missing_text = "Missing",
+                        type=list(SRH ~ "continuous")) %>%
+  add_p() %>% bold_labels() %>% add_overall() %>%
+  as_flex_table() %>% align(align = "center",part = "all") %>% autofit()
+
+## Population flowchart ##
+# Number of participants
+MHAS_n1 <- MHAS_full %>% nrowf2
+MHAS_n2 <- MHAS_fin %>% nrowf2
+MHAS_n3 <- MHAS.A1_W %>% filter(
+  !is.na(AnthropoAge), !is.na(TTDM), wtresp!=0,
+  !is.na(mortstat2), !is.na(wtresp)) %>% filter(!duplicated(ID)) %>%  nrowf2
+MHAS_n4 <- MHAS.A1 %>% filter(!duplicated(ID)) %>% nrowf2
+# Number of visits
+MHAS_v1 <- nrowf2(MHAS_full %>% select((1:5 %>% sapply(
+  gsub, pattern="@", x=c("r@agey")) %>% as.character)) %>% pivot_longer(
+    cols=1:5,names_to=c("wave",".value"),names_pattern="^r(\\d)(.*)"))
+MHAS_v2 <- nrowf2(MHAS_fin %>% select((1:3 %>% sapply(
+  gsub, pattern="@", x=c("r@agey")) %>% as.character)) %>% pivot_longer(
+    cols=1:3,names_to=c("wave",".value"),names_pattern="^r(\\d)(.*)"))
+MHAS_v3 <- MHAS.A1_W %>% filter(!is.na(AnthropoAge), !is.na(mortstat2),
+                                !is.na(wtresp), wtresp!=0) %>%  nrowf2
+MHAS_v4 <- MHAS.A1 %>% nrowf2
+# Remove to save disk memory
+remove(MHAS, MHAS_full, MHAS_fin, MHAS.A1_W, MHAS.A1.0, MHAS.remov, MHAS_tab)
 
 
-#CRELES---------- ####
+#CRELES----------- ####
 ## CRELES ## -- 3 Waves: 2005 (1), 2007 (2), 2009 (3)
 ## S-AnthropoAge can be calculated in W1-W3
 CRELES_W1 <- readRDS("Databases/CRELES/W1_CRELES.rds.gz")%>% distinct()
@@ -571,8 +831,12 @@ CRELES$mortstat<-ifelse(
   CRELES$r1iwstat%in%5:6 | CRELES$r2iwstat%in%5:6 | CRELES$r3iwstat%in%5:6,
   1,0); CRELES$mortstat[CRELES$mortstat==0]<-NA
 
+# Include only waves 1-3
+CRELES_fin <- CRELES %>% filter((inw1==1|inw2==1|inw3==1)); remove(
+  CRELES_W1,CRELES_W2,CRELES_W3, CRELES_W1a,CRELES_W2a,CRELES_W3a, CRELES_D)
+
 # Select variables and change to long format
-CRELES.A1.0 <- CRELES %>% select(
+CRELES.A1.0 <- CRELES_fin %>% select(
   idsujeto, ragender, raeducl, mortstat, radmonth, radyear, hacohort,
   inw1, inw2, inw3, (1:3 %>% sapply(gsub, pattern="@", x=c(
     "r@wtresp", "r@iwy", "r@iwm","r@agey", "r@iwstat", "r@shlt",
@@ -616,35 +880,57 @@ CRELES.A1_W <- CRELES.A1_W %>% mutate (E.DATE = ifelse(
   mortstat2==0|is.na(D.DATE), as.character(LAST.IW),
   as.character(D.DATE)) %>% as.Date)
 
-# Filters
-CRELES.A1 <- CRELES.A1_W %>%
-  mutate( #Time to death in months + country specific race/ethnicity
-    "TTDM"=interval(start=B.DATE,end=E.DATE) %/% months(1),
-    "Ethnicity2"=paste0("CR-", race_ethnicity1[3])) %>%
-  filter( #Complete follow-up data (≥0 months)
-    wave%in%1:3) %>% filter(TTDM>=0|is.na(TTDM)) %>%
-  filter( #Complete AnthropoAge (non-infinite) and mortality data
-    !is.infinite(AnthropoAge), !is.na(AnthropoAge),
-    !is.na(mortstat2), !is.na(B.DATE), !is.na(wtresp), wtresp!=0) %>%
-  filter( #Age 50-90, anthropometry within original NHANES-III ranges
-    Age>=50, Age<90, AnthropoAge>=10, Height>=125, Height<=200,
-    Weight>=30, Weight<=150, Waist>=50, Waist<=160, BMI>=15, BMI<=60)
+# Adiposity indices
+#A Body Shape Index (ABSI)
+CRELES.A1_W$ABSI <- with(
+  CRELES.A1_W,(Waist*10)*(Weight)^(-2/3)*(Height/100)^(5/6)) 
+#Weight-adjusted-waist index (WWI) 
+CRELES.A1_W$WWI <- with(CRELES.A1_W, Waist/sqrt(Weight)) 
+#Body Roundness Index (BRI)
+#BRI formula = 365.2 − 365.5 * (1 − (wc/2π)^2/(0.5 × height)^2)^(1/2)
+CRELES.A1_W$BRI <- with(
+  CRELES.A1_W, 365.2-365.5*sqrt(1-((Waist/(2*pi))^2)/((0.5*(Height))^2))) 
 
 # Education and lifestyle
 #Education
-CRELES.A1$Education <- CRELES.A1$raeducl %>%
+CRELES.A1_W$Education <- CRELES.A1_W$raeducl %>%
   factor(1:3, c("Primary or less", "Secondary", "Tertiary"))
 #Smoking
-CRELES.A1$Smoking <- CRELES.A1 %>% with(case_when(
+CRELES.A1_W$Smoking <- CRELES.A1_W %>% with(case_when(
   smokev==0~0, smoken==0~1, smokef<10~2, smokef>=10~3)) %>%
   factor(0:3, c("Never smoker","Former smoker","<10/day",">=10/day"))
 #Drinking
-CRELES.A1$Drinking <- CRELES.A1 %>% with(case_when(
+CRELES.A1_W$Drinking <- CRELES.A1_W %>% with(case_when(
   drinkd_cr==0~0, drinkd_cr==1~1, drinkd_cr==2~2, drinkd_cr==3~3)) %>%
   factor(0:3, c("Never","Less than weekly","Less than daily","Daily"))
 #Frequent physical activity (>1/week)
-CRELES.A1$VigPA1 <- with(CRELES.A1,case_when(vigact==0~0,vigact==1~1))
-CRELES.A1$VigPA2 <- CRELES.A1$VigPA1 %>% factor(0:1, c("No","Yes"))
+CRELES.A1_W$VigPA1 <- with(CRELES.A1_W,case_when(vigact==0~0,vigact==1~1))
+CRELES.A1_W$VigPA2 <- CRELES.A1_W$VigPA1 %>% factor(0:1, c("No","Yes"))
+
+# Number of comorbidities
+corrNA <- function(x){ifelse(x%in%0:1,x,NA)}; CRELES.A1_W<-CRELES.A1_W%>%mutate(
+  "HBP"=corrNA(HBP), "T2D"=corrNA(T2D), "CAN"=corrNA(CAN), "LUD"=corrNA(LUD),
+  "AMI"=corrNA(AMI), "EVC"=corrNA(EVC), "ART"=corrNA(ART))
+CRELES.A1_W$n_comorb <- with(CRELES.A1_W, HBP+T2D+CAN+LUD+AMI+EVC+ART)
+CRELES.A1_W$comorb_cat <- cut(CRELES.A1_W$n_comorb, breaks=c(-Inf,0,1,Inf)) %>%
+  ordered(labels=c("0","1",">=2"))
+
+# Time to death in months + country specific race/ethnicity
+CRELES.A1_W <- CRELES.A1_W %>%
+  mutate("TTDM"=interval(start=B.DATE,end=E.DATE) %/% months(1),
+         "Ethnicity2"=factor(Ethnicity, levels=race_ethnicity1,
+                             labels=paste0("CR-",race_ethnicity1)))
+
+# Filters
+CRELES.A1 <- CRELES.A1_W %>%
+  filter( #Complete follow-up data (≥0 months)
+    TTDM>=0|is.na(TTDM)) %>% filter(!is.na(coh)) %>%
+  filter( #Complete AnthropoAge (non-infinite) and mortality data
+    !is.infinite(AnthropoAge), !is.na(AnthropoAge),
+    !is.na(mortstat2), !is.na(wtresp), wtresp!=0) %>%
+  filter( #Age 50-90, anthropometry within original NHANES-III ranges
+    Age>=50, Age<90, AnthropoAge>=10, Height>=125, Height<=200,
+    Weight>=30, Weight<=150, Waist>=50, Waist<=160, BMI>=15, BMI<=60)
 
 # Set different baselines
 CRELES.A1_B1 <- CRELES.A1 %>% filter(wave==2&inw2==1) %>%
@@ -652,14 +938,74 @@ CRELES.A1_B1 <- CRELES.A1 %>% filter(wave==2&inw2==1) %>%
 CRELES.A1_B2 <- CRELES.A1 %>% filter(wave==3&inw3==1) %>%
   filter(!duplicated(ID)) #Only 2009 + remove follow-ups
 CRELES.A1_BX <- CRELES.A1 %>% filter(!duplicated(ID)) #Remove follow-ups
+CRELES.remov <- CRELES.A1_W[!(CRELES.A1_W$ID %in% CRELES.A1$ID),] %>%
+  filter(!duplicated(ID)) #Remove follow-ups (NOT included)
+
+## Included vs not included table ##
+CRELES.A1_BX$inc_rem <- "Included"; CRELES.remov$inc_rem <- "Not included"
+CRELES_tab <- rbind(CRELES.A1_BX, CRELES.remov) %>% transmute(
+  inc_rem, Age, "Sex"=ifelse(Sex=="Women",1,0),
+  "Education"=ifelse(Education=="Primary or less",1,0),
+  BMI, ICE, AnthropoAge, Smoking, Drinking, VigPA1, ADL, IADL, SRH, T2D, HBP,
+  AMI, CAN, LUD, EVC, ART, comorb_cat, mortstat2, "TTDY"=TTDM/12) %>% mutate(
+    "T2D"=case_when(T2D==1~1, T2D==0~0), "HBP"=case_when(HBP==1~1, HBP==0~0),
+    "AMI"=case_when(AMI==1~1, AMI==0~0), "CAN"=case_when(CAN==1~1, CAN==0~0),
+    "LUD"=case_when(LUD==1~1, LUD==0~0), "EVC"=case_when(EVC==1~1, EVC==0~0),
+    "ART"=case_when(ART==1~1, ART==0~0),
+    "Drinking"=ifelse(Drinking=="Never",0,1),
+    "Smoking"=ifelse(Smoking%in%c("Never smoker", "Former smoker"),0,1),
+    "comorb_cat"=ifelse(comorb_cat==">=2",1,0), "ADL"=ifelse(ADL==0,0,1),
+    "IADL"=ifelse(IADL==0,0,1), "SRH"=case_when(SRH%in%1:5~as.numeric(SRH)))
+
+#Set labels
+labs1 <- names(CRELES_tab)[-1]; nlab <- labs1 %>% length
+labs2 <- c(
+  "Age (years)", "Women (%)", "Primary or less education (%)",
+  "BMI (kg/m^2)", "WHtR", "AnthropoAge (years)", "Current smoker (%)",
+  "Current alcohol intake (%)", "Frequent vigorous activity (%)",
+  "≥1 ADL deficit (%)", "≥1 IADL deficit (%)", "Self-reported health",
+  "Diabetes mellitus (%)","Arterial hypertension (%)",
+  "Myocardial infarction (%)","Cancer (%)", "Chronic lung disease (%)",
+  "Stroke (%)","Arthritis (%)", "Multimorbidity (%)",
+  "Number of deahts (%)", "Follow-up time (years)")
+for(i in 1:nlab){with(CRELES_tab, setattr(get(labs1[i]), "label", labs2[i]))}
+
+#Create table
+tab_CRELES <- tbl_summary(CRELES_tab, by=inc_rem, missing = "always",
+                          missing_text = "Missing",
+                        type=list(SRH ~ "continuous")) %>%
+  add_p() %>% bold_labels() %>% add_overall() %>%
+  as_flex_table() %>% align(align = "center",part = "all") %>% autofit()
 
 
-#CHARLS---------- ####
+## Population flowchart ##
+# Number of participants
+CRELES_n1 <- CRELES %>% nrowf2
+CRELES_n2 <- CRELES_fin %>% nrowf2
+CRELES_n3 <- CRELES.A1_W %>% filter( 
+  !is.na(AnthropoAge), !is.na(mortstat2), !is.na(wtresp), wtresp!=0) %>%
+  filter(!duplicated(ID)) %>%  nrowf2
+CRELES_n4 <- CRELES.A1 %>% filter(!duplicated(ID)) %>% nrowf2
+# Number of visits
+CRELES_v1 <- nrowf2(CRELES %>% select((1:3 %>% sapply(
+  gsub, pattern="@", x=c("r@agey")) %>% as.character)) %>% pivot_longer(
+    cols=1:3,names_to=c("wave",".value"),names_pattern="^r(\\d)(.*)"))
+CRELES_v2 <- nrowf2(CRELES_fin %>% select((1:3 %>% sapply(
+  gsub, pattern="@", x=c("r@agey")) %>% as.character)) %>% pivot_longer(
+    cols=1:3,names_to=c("wave",".value"),names_pattern="^r(\\d)(.*)"))
+CRELES_v3 <- CRELES.A1_W %>% filter(!is.na(AnthropoAge), !is.na(mortstat2),
+                                    !is.na(wtresp), wtresp!=0) %>%  nrowf2
+CRELES_v4 <- CRELES.A1 %>% nrowf2
+# Remove to save disk memory
+remove(CRELES, CRELES_fin, CRELES.A1_W, CRELES.A1.0, CRELES.remov, CRELES_tab)
+
+#CHARLS----------- ####
 ## CHARLS ## -- 5 Waves: 2011/12 (1), 2013/14 (2),
 #                        2015/16 (3), 2018 (4), 2020 (5)
 ## S-AnthropoAge can be calculated only in W1-W3
 #Harmonized data
 CHARLS <- readRDS("Databases/H_CHARLS_D.rds.gz")
+
 
 #2020 follow-up data
 CHARLS20.c <- read_dta("Databases/CHARLS/2020/Demographic_Background.dta")#Core
@@ -697,15 +1043,20 @@ CHARLS20_fin <- CHARLS20 %>% left_join(rbind(solar2,lunar2), by="ID") %>%
   select(ID, r5iwy, r5iwm, rady20, radm20, r5iwstat)
 
 #Merge 2020 follow-up with harmonized data
-CHARLS_fin <- CHARLS %>% left_join(CHARLS20_fin, by = "ID")
+CHARLS_full <- CHARLS %>% left_join(CHARLS20_fin, by = "ID")
+
 #Interview status at wave 5
-CHARLS_fin$r5iwstat <- with( #1=Respondent, alive
-  CHARLS_fin, case_when(!is.na(r5iwstat)~r5iwstat, #5=Died this wave
+CHARLS_full$r5iwstat <- with( #1=Respondent, alive
+  CHARLS_full, case_when(!is.na(r5iwstat)~r5iwstat, #5=Died this wave
                         is.na(r5iwstat)&r4iwstat%in%5:6~6, #6=Died prev. wave
-                        is.na(r5iwstat)&!r4iwstat%in%5:6~9)) #9=Unknown
+                        is.na(r5iwstat)&!(r4iwstat%in%5:6)~9)) #9=Unknown
 #Updated year and month of death
-CHARLS_fin$radyear<-with(CHARLS_fin,ifelse((!is.na(rady20)),rady20,radyear))
-CHARLS_fin$radmonth<-with(CHARLS_fin,ifelse((!is.na(radm20)),radm20,radmonth))
+CHARLS_full$radyear<-with(CHARLS_full,ifelse((!is.na(rady20)),rady20,radyear))
+CHARLS_full$radmonth<-with(CHARLS_full,ifelse((!is.na(radm20)),radm20,radmonth))
+
+# Include only waves 1-3
+CHARLS_fin <- CHARLS_full %>% filter((inw1==1|inw2==1|inw3==1))
+remove(CHARLS20.c,CHARLS20.h,CHARLS20.d, CHARLS20,CHARLS20_fin, lunar,solar)
 
 # Select variables and change to long format
 CHARLS.A1.0 <- CHARLS_fin %>% select(
@@ -757,13 +1108,52 @@ CHARLS.A1_W <- CHARLS.A1_W %>% mutate("E.DATE" = ifelse(
   mortstat2==0|is.na(D.DATE), as.character(LAST.IW),
   as.character(D.DATE)) %>% as.Date)
 
+# Adiposity indices
+#A Body Shape Index (ABSI)
+CHARLS.A1_W$ABSI <- with(
+  CHARLS.A1_W,(Waist*10)*(Weight)^(-2/3)*(Height/100)^(5/6)) 
+#Weight-adjusted-waist index (WWI) 
+CHARLS.A1_W$WWI <- with(CHARLS.A1_W, Waist/sqrt(Weight)) 
+#Body Roundness Index (BRI)
+#BRI formula = 365.2 − 365.5 * (1 − (wc/2π)^2/(0.5 × height)^2)^(1/2)
+CHARLS.A1_W$BRI <- with(
+  CHARLS.A1_W, 365.2-365.5*sqrt(1-((Waist/(2*pi))^2)/((0.5*(Height))^2))) 
+
+# Education and lifestyle
+#Education
+CHARLS.A1_W$Education <- CHARLS.A1_W$raeducl %>%
+  factor(1:3, c("Primary or less", "Secondary", "Tertiary"))
+#Smoking
+CHARLS.A1_W$Smoking <- CHARLS.A1_W %>% with(case_when(
+  smokev==0~0, smoken==0~1, smokef<10~2, smokef>=10~3)) %>%
+  factor(0:3, c("Never smoker","Former smoker","<10/day",">=10/day"))
+#Drinking
+CHARLS.A1_W$Drinking <- CHARLS.A1_W %>% with(case_when(
+  drinkn_c==0~0, drinkn_c%in%1:3~1, drinkn_c%in%4:6~2, drinkn_c%in%7:9~3)) %>%
+  factor(0:3, c("Never","Less than weekly","Less than daily","Daily"))
+#Frequent physical activity (>1/week)
+CHARLS.A1_W$VigPA1 <- with(CHARLS.A1_W,case_when(vgactx_c<=3~0,vgactx_c>3~1))
+CHARLS.A1_W$VigPA2 <- CHARLS.A1_W$VigPA1 %>% factor(0:1, c("No","Yes"))
+
+# Number of comorbidities
+corrNA <- function(x){ifelse(x%in%0:1,x,NA)}; CHARLS.A1_W<-CHARLS.A1_W%>%mutate(
+  "HBP"=corrNA(HBP), "T2D"=corrNA(T2D), "CAN"=corrNA(CAN), "LUD"=corrNA(LUD),
+  "AMI"=corrNA(AMI), "EVC"=corrNA(EVC), "ART"=corrNA(ART))
+CHARLS.A1_W$n_comorb <- with(CHARLS.A1_W, HBP+T2D+CAN+LUD+AMI+EVC+ART)
+CHARLS.A1_W$comorb_cat <- cut(CHARLS.A1_W$n_comorb, breaks=c(-Inf,0,1,Inf)) %>%
+  ordered(labels=c("0","1",">=2"))
+
+# Time to death in months + country specific race/ethnicity
+CHARLS.A1_W <- CHARLS.A1_W %>%
+  mutate("TTDM"=interval(start=B.DATE,end=E.DATE) %/% months(1),
+         "Ethnicity2"=factor(Ethnicity, levels=race_ethnicity1,
+                             labels=paste0("CH-",race_ethnicity1)))
+
 # Filters
-CHARLS.A1 <- CHARLS.A1_W %>%
-  mutate( #Time to death in months + country specific race/ethnicity
-    "TTDM"=interval(start=B.DATE,end=E.DATE) %/% months(1),
-    "Ethnicity2"="CH-Other") %>%
+CHARLS.A1_W_fin <- CHARLS.A1_W %>%
+  filter(iwy<2018); CHARLS.A1 <- CHARLS.A1_W_fin %>%
   filter( #Complete follow-up data (≥0 months)
-    TTDM>=0|is.na(TTDM)) %>% filter(!is.na(coh)) %>% 
+    TTDM>=0|is.na(TTDM)) %>% filter(!is.na(coh)) %>%
   filter( #Complete AnthropoAge (non-infinite) and mortality data
     !is.infinite(AnthropoAge), !is.na(AnthropoAge),
     !is.na(mortstat2), !is.na(wtresp), wtresp!=0) %>%
@@ -771,29 +1161,73 @@ CHARLS.A1 <- CHARLS.A1_W %>%
     Age>=50, Age<90, AnthropoAge>=10, Height>=125, Height<=200,
     Weight>=30, Weight<=150, Waist>=50, Waist<=160, BMI>=15, BMI<=60)
 
-# Education and lifestyle
-#Education
-CHARLS.A1$Education <- CHARLS.A1$raeducl %>%
-  factor(1:3, c("Primary or less", "Secondary", "Tertiary"))
-#Smoking
-CHARLS.A1$Smoking <- CHARLS.A1 %>% with(case_when(
-  smokev==0~0, smoken==0~1, smokef<10~2, smokef>=10~3)) %>%
-  factor(0:3, c("Never smoker","Former smoker","<10/day",">=10/day"))
-#Drinking
-CHARLS.A1$Drinking <- CHARLS.A1 %>% with(case_when(
-  drinkn_c==0~0, drinkn_c%in%1:3~1, drinkn_c%in%4:6~2, drinkn_c%in%7:9~3)) %>%
-  factor(0:3, c("Never","Less than weekly","Less than daily","Daily"))
-#Frequent physical activity (>1/week)
-CHARLS.A1$VigPA1 <- with(CHARLS.A1,case_when(vgactx_c<=3~0,vgactx_c>3~1))
-CHARLS.A1$VigPA2 <- CHARLS.A1$VigPA1 %>% factor(0:1, c("No","Yes"))
-
 # Set different baselines
 CHARLS.A1_B1 <- CHARLS.A1 %>% filter(wave==1&inw1==1) %>%
   filter(!duplicated(ID)) #Only 2011/12 + remove follow-ups
 CHARLS.A1_BX <- CHARLS.A1 %>% filter(!duplicated(ID)) #Remove follow-ups
+CHARLS.remov <- CHARLS.A1_W_fin[!(CHARLS.A1_W_fin$ID %in% CHARLS.A1$ID),] %>%
+  filter(!duplicated(ID)) #Remove follow-ups (NOT included)
+
+## Included vs not included table ##
+CHARLS.A1_BX$inc_rem <- "Included"; CHARLS.remov$inc_rem <- "Not included"
+CHARLS_tab <- rbind(CHARLS.A1_BX, CHARLS.remov) %>% transmute(
+  inc_rem, Age, "Sex"=ifelse(Sex=="Women",1,0),
+  "Education"=ifelse(Education=="Primary or less",1,0),
+  BMI, ICE, AnthropoAge, Smoking, Drinking, VigPA1, ADL, IADL, SRH, T2D, HBP,
+  AMI, CAN, LUD, EVC, ART, comorb_cat, mortstat2, "TTDY"=TTDM/12) %>% mutate(
+    "T2D"=case_when(T2D==1~1, T2D==0~0), "HBP"=case_when(HBP==1~1, HBP==0~0),
+    "AMI"=case_when(AMI==1~1, AMI==0~0), "CAN"=case_when(CAN==1~1, CAN==0~0),
+    "LUD"=case_when(LUD==1~1, LUD==0~0), "EVC"=case_when(EVC==1~1, EVC==0~0),
+    "ART"=case_when(ART==1~1, ART==0~0),
+    "Drinking"=ifelse(Drinking=="Never",0,1),
+    "Smoking"=ifelse(Smoking%in%c("Never smoker", "Former smoker"),0,1),
+    "comorb_cat"=ifelse(comorb_cat==">=2",1,0), "ADL"=ifelse(ADL==0,0,1),
+    "IADL"=ifelse(IADL==0,0,1), "SRH"=case_when(SRH%in%1:5~as.numeric(SRH)))
+
+#Set labels
+labs1 <- names(CHARLS_tab)[-1]; nlab <- labs1 %>% length
+labs2 <- c(
+  "Age (years)", "Women (%)", "Primary or less education (%)",
+  "BMI (kg/m^2)", "WHtR", "AnthropoAge (years)", "Current smoker (%)",
+  "Current alcohol intake (%)", "Frequent vigorous activity (%)",
+  "≥1 ADL deficit (%)", "≥1 IADL deficit (%)", "Self-reported health",
+  "Diabetes mellitus (%)","Arterial hypertension (%)",
+  "Myocardial infarction (%)","Cancer (%)", "Chronic lung disease (%)",
+  "Stroke (%)","Arthritis (%)", "Multimorbidity (%)",
+  "Number of deahts (%)", "Follow-up time (years)")
+for(i in 1:nlab){with(CHARLS_tab, setattr(get(labs1[i]), "label", labs2[i]))}
+CHARLS_tab$Age %>% hist
+#Create table
+tab_CHARLS <- tbl_summary(CHARLS_tab, by=inc_rem, missing = "always",
+                          missing_text = "Missing",
+                        type=list(SRH ~ "continuous")) %>%
+  add_p() %>% bold_labels() %>% add_overall() %>%
+  as_flex_table() %>% align(align = "center",part = "all") %>% autofit()
+
+## Population flowchart ##
+# Number of participants
+CHARLS_n1 <- CHARLS_full %>% nrowf2
+CHARLS_n2 <- CHARLS_fin %>% nrowf2
+CHARLS_n3 <- CHARLS.A1_W %>% filter( 
+  !is.na(AnthropoAge), !is.na(mortstat2), !is.na(wtresp), wtresp!=0) %>%
+  filter(!duplicated(ID)) %>%  nrowf2
+CHARLS_n4 <- CHARLS.A1 %>% filter(!duplicated(ID)) %>% nrowf2
+# Number of visits
+CHARLS_v1 <- nrowf2(CHARLS_full %>% select((1:4 %>% sapply(
+  gsub, pattern="@", x=c("r@agey")) %>% as.character)) %>% pivot_longer(
+    cols=1:4,names_to=c("wave",".value"),names_pattern="^r(\\d)(.*)"))
+CHARLS_v2 <- nrowf2(CHARLS_fin %>% select((1:3 %>% sapply(
+  gsub, pattern="@", x=c("r@agey")) %>% as.character)) %>% pivot_longer(
+    cols=1:3,names_to=c("wave",".value"),names_pattern="^r(\\d)(.*)"))
+CHARLS_v3 <- CHARLS.A1_W %>% filter(!is.na(AnthropoAge), !is.na(mortstat2),
+                                    !is.na(wtresp), wtresp!=0) %>%  nrowf2
+CHARLS_v4 <- CHARLS.A1 %>% nrowf2
+# Remove to save disk memory
+remove(CHARLS, CHARLS_full, CHARLS_fin, CHARLS.A1_W, CHARLS.A1_W_fin,
+       CHARLS.A1.0, CHARLS.remov, CHARLS_tab)
 
 
-#Pooled---------- ####
+#Pooled----------- ####
 ### BASELINE + FOLLOW-UPS ###
 #Race/ethnicity recoding
 race_ethnicity3 <- c(
@@ -808,7 +1242,8 @@ mega_var <- c(
   "consecutives", "Ethnicity", "Ethnicity2", "Sex", "Age", "mortstat2",
   "TTDM", "B.DATE", "D.DATE", "E.DATE", "AnthropoAge", "BMI","ICE","SRH",
   "ADL", "IADL", "HBP", "T2D", "CAN", "LUD", "AMI", "EVC", "ART",
-  "Education","Smoking","Drinking","VigPA1","VigPA2")
+  "Education","Smoking","Drinking","VigPA1","VigPA2",
+  "n_comorb","comorb_cat", "ABSI", "BRI", "WWI")
 HRS.A1 <- HRS.A1 %>% mutate(
   "baseline"=haven::labelled(ifelse(INW8+INW9>0, 1, 0))
   ); G2A_mega <- rbind(
@@ -819,12 +1254,7 @@ HRS.A1 <- HRS.A1 %>% mutate(
   CRELES.A1 %>% select(all_of(mega_var), "Weights"=wtresp, "baseline"=inw1)
   ) %>% mutate("JID" = paste0(G2ASTUDY, ID),
          "Ethnicity2" = ordered(Ethnicity2, levels=race_ethnicity3))
-#Comorbidities
-health_var <- c(
-  "SRH", "ADL", "IADL", "HBP", "T2D", "CAN", "LUD", "AMI", "EVC", "ART",
-  "Education","Smoking","Drinking","VigPA1","VigPA2")
-G2A_mega$n_comorb <- G2A_mega %>% select(
-  all_of(health_var[4:10])) %>% apply(1,sum, na.rm=T)
+
 #AnthropoAgeAccel
 G2A_mega$AnthropoAgeAccel[
   with(G2A_mega,!is.na(AnthropoAge)&Sex=="Men")] <- lmer(
@@ -841,8 +1271,6 @@ G2A_mega <- G2A_mega %>% group_by(year) %>%
       factor(labels=c("Q1","Q2","Q3","Q4"))) %>% ungroup %>% 
   mutate(
     "accel"=ifelse(AnthropoAgeAccel>0,1,0),
-    "comorb_cat"=cut(n_comorb, breaks=c(-Inf,0,1,Inf)) %>%
-      ordered(labels=c("0","1",">=2")),
     "bi"=factor(bi, labels=c("01/02","03/04","05/06","07/08","09/10",
                              "11/12","13/14","15/16","17/18")),
     "Country"=ordered(G2ASTUDY, levels=c(
@@ -871,17 +1299,6 @@ G2A_mega5 <- filter(G2A_mega, G2ASTUDY=="CHARLS")
 
 
 ### BASELINE ###
-MHAS.A1_BX$n_comorb <- MHAS.A1_BX %>% select(
-  all_of(health_var[4:10])) %>% apply(1,sum, na.rm=T)
-HRS.A1_BX$n_comorb <- HRS.A1_BX %>% select(
-  all_of(health_var[4:10])) %>% apply(1, sum, na.rm=T)
-ELSA.A1_BX$n_comorb <- ELSA.A1_BX %>% select(
-  all_of(health_var[4:10])) %>%
-  apply(2, function(x){ifelse(x==1,1,0)}) %>% apply(1,sum, na.rm=T)
-CRELES.A1_BX$n_comorb <- CRELES.A1_BX %>% select(
-  all_of(health_var[4:10])) %>% apply(1,sum, na.rm=T)
-CHARLS.A1_BX$n_comorb <- CHARLS.A1_BX %>% select(
-  all_of(health_var[4:10])) %>% apply(1,sum, na.rm=T)
 #Variable selection
 pooled <- rbind(
   HRS.A1_BX %>% rename("Weights"=WTRESP) %>% select( #HRS
@@ -917,14 +1334,12 @@ pooled<- pooled %>% filter(Weights!=0) %>%
     "accelQ4"=quantcut(AnthropoAgeAccel,4) %>%
       factor(labels=c("Q1","Q2","Q3","Q4")),
     "accel"=ifelse(AnthropoAgeAccel>=0,1,0),
-    "comorb_cat"=cut(n_comorb, breaks=c(-Inf,0,1,Inf)) %>%
-      ordered(labels=c("0","1",">=2")),
     "Ethnicity"= Ethnicity %>% factor(labels=c(
-      "White","Black","Hispanic/Latino","Chinese")),
+      "White","Black","Hispanic/Latino","Other (Asian)")),
     "G2ASTUDY"=factor(G2ASTUDY, levels=c(
       "HRS","ELSA","MHAS","CRELES","CHARLS"))) %>% group_by(G2ASTUDY) %>%
   mutate(
-    "std_weights"=Weights*(n()/sum(Weights))) %>% ungroup()
+    "TTDY"=TTDM/12, "std_weights"=Weights*(n()/sum(Weights))) %>% ungroup()
 #By Study
 pooled0 <- pooled
 pooled1 <- filter(pooled, G2ASTUDY=="HRS")
@@ -934,23 +1349,18 @@ pooled4 <- filter(pooled, G2ASTUDY=="CRELES")
 pooled5 <- filter(pooled, G2ASTUDY=="CHARLS")
 nrow(pooled); nrow(G2A_mega)
 
-
-#Fig 1: Flowchart ####
+#Fig 1: Flowchart- ####
 ##-------------------------------- HRS --------------------------------##
 ## Number of participants
-HRS_alt %>% nrowf2 #1
-HRS.A1_W %>% filter( 
-  !is.na(AnthropoAge), !is.na(mortstat2), !is.na(WTRESP), WTRESP!=0) %>%
-  filter(!duplicated(ID)) %>%  nrowf2 #2
-HRS.A1 %>% filter(!duplicated(ID)) %>% nrowf2 #3
+HRS_n1
+HRS_n2
+HRS_n3
+HRS_n4
 ## Number of visits
-HRS_alt %>% select( 
-  (1:14 %>% sapply(gsub, pattern="@", x=c("R@AGEY_E")) %>% as.character)) %>%
-  pivot_longer(cols=1:14, names_to = c("wave",".value"),
-               names_pattern = "^R(\\d)(.*)") %>% nrowf2 #1
-HRS.A1_W %>% filter(!is.na(AnthropoAge), !is.na(mortstat2),
-                    !is.na(WTRESP), WTRESP!=0) %>%  nrowf2 #2
-HRS.A1 %>% nrowf2 #3
+HRS_v1
+HRS_v2
+HRS_v3
+HRS_v4
 ## Deaths
 (HRS.A1_BX$mortstat2 %>% table)[2] %>% format(big.mark=",")
 (HRS.A1_BX$mortstat2 %>% table %>% prop.table)[2]
@@ -958,44 +1368,34 @@ HRS.A1 %>% nrowf2 #3
 with(HRS.A1_BX, fllwp.yrs(TTDM))
 (with(HRS.A1_BX, sum(TTDM))/12) %>% floor
 
-
 ##-------------------------------- ELSA --------------------------------##
 ## Number of participants
-ELSA %>% nrowf2 #1
-ELSA.A1_W %>% filter(
-  !is.na(AnthropoAge), !is.na(mortstat2), !is.na(cwtresp),
-  cwtresp!=0) %>% filter(!duplicated(ID)) %>% nrowf2 #2
-ELSA.A1 %>% filter(!duplicated(ID)) %>% nrowf2 #3
+ELSA_n1
+ELSA_n2
+ELSA_n3
+ELSA_n4
 ## Number of visits
-ELSA %>% select(
-  (1:9 %>% sapply(gsub, pattern="@", x=c("r@agey")) %>% as.character)) %>%
-  pivot_longer(cols=1:9, names_to = c("wave",".value"),
-               names_pattern = "^r(\\d)(.*)") %>% nrowf2 #1
-ELSA.A1_W %>% filter(!is.na(AnthropoAge), !is.na(mortstat2),
-                     !is.na(cwtresp), cwtresp!=0) %>%  nrowf2 #2
-ELSA.A1 %>% nrowf2 #3
+ELSA_v1
+ELSA_v2
+ELSA_v3
+ELSA_v4
 ## Deaths
 (ELSA.A1_BX$mortstat2 %>% table)[2] %>% format(big.mark=",")
 ## Follow-up
 with(ELSA.A1_BX, fllwp.yrs(TTDM))
 (with(ELSA.A1_BX, sum(TTDM))/12) %>% floor
 
-
 ##-------------------------------- MHAS --------------------------------##
 ## Number of participants
-MHAS_fin %>% nrowf2 #1
-MHAS.A1_W %>% filter( 
-  !is.na(AnthropoAge), !is.na(mortstat2), !is.na(wtresp)) %>%
-  filter(!duplicated(ID)) %>%  nrowf2 #2
-MHAS.A1 %>% filter(!duplicated(ID)) %>% nrowf2 #3
+MHAS_n1
+MHAS_n2
+MHAS_n3
+MHAS_n4
 ## Number of visits
-MHAS_fin %>% select(
-  (1:5 %>% sapply(gsub, pattern="@", x=c("r@agey")) %>% as.character)) %>%
-  pivot_longer(cols=1:5, names_to = c("wave",".value"),
-               names_pattern = "^r(\\d)(.*)") %>% nrowf2 #1
-MHAS.A1_W %>% filter(!is.na(AnthropoAge), !is.na(mortstat2),
-                     !is.na(wtresp), wtresp!=0) %>%  nrowf2 #2
-MHAS.A1 %>% nrowf2 #3
+MHAS_v1
+MHAS_v2
+MHAS_v3
+MHAS_v4
 ## Deaths
 (MHAS.A1_BX$mortstat2 %>% table)[2] %>% format(big.mark=",")
 ## Follow-up
@@ -1007,44 +1407,34 @@ MHAS.A1_B2 %>% nrowf2
 (MHAS.A1_B2$mortstat2 %>% table)[2] %>% format(big.mark=",")
 with(MHAS.A1_B2, fllwp.yrs(TTDM))
 
-
 ##-------------------------------- CRELES --------------------------------##
 ## Number of participants
-CRELES %>% nrowf2 #1
-CRELES.A1_W %>% filter(
-  !is.na(AnthropoAge), !is.na(mortstat2), !is.na(wtresp),
-  wtresp!=0) %>% filter(!duplicated(ID)) %>% nrowf2 #2
-CRELES.A1 %>% filter(!duplicated(ID)) %>% nrowf2 #3
+CRELES_n1
+CRELES_n2
+CRELES_n3
+CRELES_n4
 ## Number of visits
-CRELES %>% select(
-  (1:4 %>% sapply(gsub, pattern="@", x=c("r@agey")) %>% as.character)) %>%
-  pivot_longer(cols=1:4, names_to = c("wave",".value"),
-               names_pattern = "^r(\\d)(.*)") %>% nrowf2 #1
-CRELES.A1_W %>% filter(!is.na(AnthropoAge), !is.na(mortstat2),
-                       !is.na(wtresp), wtresp!=0) %>%  nrowf2 #2
-CRELES.A1 %>% nrowf2 #3
+CRELES_v1
+CRELES_v2
+CRELES_v3
+CRELES_v4
 ## Deaths
 (CRELES.A1_BX$mortstat2 %>% table)[2] %>% format(big.mark=",")
 ## Follow-up
 with(CRELES.A1_BX, fllwp.yrs(TTDM))
 (with(CRELES.A1_BX, sum(TTDM))/12) %>% floor
 
-
 ##-------------------------------- CHARLS --------------------------------##
 ## Number of participants
-CHARLS_fin %>% nrowf2 #1
-CHARLS.A1_W %>% filter(
-  !is.na(AnthropoAge), !is.na(mortstat2), !is.na(wtresp),
-  wtresp!=0) %>% filter(!duplicated(ID)) %>% nrowf2 #2
-CHARLS.A1 %>% filter(!duplicated(ID)) %>% nrowf2 #3
+CHARLS_n1
+CHARLS_n2
+CHARLS_n3
+CHARLS_n4
 ## Number of visits
-CHARLS_fin %>% select(
-  (1:4 %>% sapply(gsub, pattern="@", x=c("r@agey")) %>% as.character)) %>%
-  pivot_longer(cols=1:4, names_to = c("wave",".value"),
-               names_pattern = "^r(\\d)(.*)") %>% nrowf2 #1
-CHARLS.A1_W %>% filter(!is.na(AnthropoAge), !is.na(mortstat2),
-                       !is.na(wtresp), wtresp!=0) %>%  nrowf2 #2
-CHARLS.A1 %>% nrowf2 #3
+CHARLS_v1
+CHARLS_v2
+CHARLS_v3
+CHARLS_v4
 ## Deaths
 (CHARLS.A1_BX$mortstat2 %>% table)[2] %>% format(big.mark=",")
 ## Follow-up
@@ -1053,9 +1443,17 @@ with(CHARLS.A1_BX, fllwp.yrs(TTDM))
 
 ##-------------------------------- OVERALL --------------------------------##
 #Overall sample
-G2A_mega %>% filter(!duplicated(ID)) %>% nrowf2 #3
+paste0(c("HRS", "ELSA", "MHAS", "CRELES", "CHARLS"), "_n", sort(rep(1:4,5)))%>%
+  as.list %>% sapply(get)%>% str_remove(",") %>% as.numeric %>%
+  matrix(nrow=4,ncol=5,byrow=T) %>% apply(1,sum) %>% format(big.mark=",")
+
+paste0(c("HRS", "ELSA", "MHAS", "CRELES", "CHARLS"), "_v", sort(rep(1:4,5)))%>%
+  as.list %>% sapply(get)%>% str_remove(",") %>% as.numeric %>%
+  matrix(nrow=4,ncol=5,byrow=T) %>% apply(1,sum) %>% format(big.mark=",")
+
 #Overal follow up
 with(pooled, fllwp.yrs(TTDM))
+with(pooled, sum(TTDM/12))
 
 #Participants followed-up from first wave with at least 2 data points
 G2A_mega0 %>% filter(baseline==1, participation>1, !duplicated(ID)) %>% nrowf2
@@ -1065,7 +1463,34 @@ G2A_mega3 %>% filter(baseline==1, participation>1, !duplicated(ID)) %>% nrowf2
 G2A_mega4 %>% filter(baseline==1, participation>1, !duplicated(ID)) %>% nrowf2
 G2A_mega5 %>% filter(baseline==1, participation>1, !duplicated(ID)) %>% nrowf2
 
-#STab1: Pop.table ####
+#Differences in follow-up
+(with(pooled, (TTDM/12)>10) %>% table %>% prop.table*100)[2]
+(with(HRS.A1_BX, (TTDM/12)>10) %>% table %>% prop.table*100)[2]
+(with(MHAS.A1_BX, (TTDM/12)>10) %>% table %>% prop.table*100)[2]
+(with(ELSA.A1_BX, (TTDM/12)>10) %>% table %>% prop.table*100)[2]
+(with(CHARLS.A1_BX, (TTDM/12)>10) %>% table %>% prop.table*100)[2]
+(with(CRELES.A1_BX, (TTDM/12)>10) %>% table %>% prop.table*100)[2]
+
+#Percentages included
+HRS_pi <- (as.numeric(str_remove(HRS_n4,","))/
+             as.numeric(str_remove(HRS_n2,","))) %>% round(3)*100
+ELSA_pi <- (as.numeric(str_remove(ELSA_n4,","))/
+              as.numeric(str_remove(ELSA_n2,","))) %>% round(3)*100
+MHAS_pi <- (as.numeric(str_remove(MHAS_n4,","))/
+              as.numeric(str_remove(MHAS_n2,","))) %>% round(3)*100
+CRELES_pi <- (as.numeric(str_remove(CRELES_n4,","))/
+                as.numeric(str_remove(CRELES_n2,","))) %>% round(3)*100
+CHARLS_pi <- (as.numeric(str_remove(CHARLS_n4,","))/
+                as.numeric(str_remove(CHARLS_n2,","))) %>% round(3)*100
+
+paste0(c(HRS_pi, 100-HRS_pi), "%")
+paste0(c(ELSA_pi, 100-ELSA_pi), "%")
+paste0(c(MHAS_pi, 100-MHAS_pi), "%")
+paste0(c(CRELES_pi, 100-CRELES_pi), "%")
+paste0(c(CHARLS_pi, 100-CHARLS_pi), "%")
+
+
+#STab1-6: Pop.tab- ####
 #--- BASELINE POPULATION CHARACTERISTICS ---#
 #Select variables
 pooled_tab <- pooled %>% transmute(
@@ -1080,12 +1505,12 @@ pooled_tab <- pooled %>% transmute(
         G2ASTUDY, c("HRS","ELSA","MHAS","CRELES","CHARLS")))
 
 #Set labels
-labs1 <- paste0(names(pooled_tab[-1])); nlab <- labs1 %>% length
+labs1 <- paste0(names(pooled_tab)[-1]); nlab <- labs1 %>% length
 labs2 <- c(
   "Age (years)", "Sex (%)", "Race/ethnicity (%)", "Education level (%)",
   "BMI (kg/m^2)", "WHtR", "AnthropoAge (years)", "AnthropoAgeAccel (years)",
   "Accelerated aging (%)", "Smoking (%)", "Alcohol intake (%)",
-  "Frequent vigorous activiy (%)", "ADL deficits (%)", "IADL deficits (%)",
+  "Frequent vigorous activity (%)", "ADL deficits (%)", "IADL deficits (%)",
   "Self-reported health (%)","Diabetes mellitus (%)",
   "Arterial hypertension (%)", "Myocardial infarction (%)",
   "Cancer (%)", "Chronic lung disease (%)", "Stroke (%)",
@@ -1094,43 +1519,276 @@ labs2 <- c(
 for(i in 1:nlab){with(pooled_tab, setattr(get(labs1[i]), "label", labs2[i]))}
 
 #Create table
-tab1 <- tbl_summary(pooled_tab, by=G2ASTUDY, missing_text = "Missing") %>%
+set_flextable_defaults(
+  font.size = 9, font.family = "Arial", table.layout="autofit", split=F,
+  table_align="center"); tab1 <- tbl_summary(
+    pooled_tab, by=G2ASTUDY, missing_text = "Missing") %>%
   add_p() %>% bold_labels() %>% add_overall() %>%
   as_flex_table() %>% align(align = "center",part = "all") %>% autofit()
 
+#Save tables
+#Overall
 set_flextable_defaults(
   split=F, table_align="center", table.layout="autofit"); read_docx() %>%
   body_add_flextable(value=tab1) %>% print(target = "Tables/TableS1.docx")
-
-#Remove to save disk memory
-remove(HRS_alt, MHAS, ELSA, CHARLS, CRELES)
-remove(HRS.A1_W, MHAS.A1_W, ELSA.A1_W, CHARLS.A1_W, CRELES.A1_W)
+#HRS
+set_flextable_defaults(
+  split=F, table_align="center", table.layout="autofit"); read_docx() %>%
+  body_add_flextable(value=tab_HRS) %>%
+  print(target = "Tables/TableS1_1HRS.docx")
+#ELSA
+set_flextable_defaults(
+  split=F, table_align="center", table.layout="autofit"); read_docx() %>%
+  body_add_flextable(value=tab_ELSA) %>%
+  print(target = "Tables/TableS1_2ELSA.docx")
+#MHAS
+set_flextable_defaults(
+  split=F, table_align="center", table.layout="autofit"); read_docx() %>%
+  body_add_flextable(value=tab_MHAS) %>%
+  print(target = "Tables/TableS1_3MHAS.docx")
+#CRELES
+set_flextable_defaults(
+  split=F, table_align="center", table.layout="autofit"); read_docx() %>%
+  body_add_flextable(value=tab_CRELES) %>%
+  print(target = "Tables/TableS1_4CRELES.docx")
+#CHARLS
+set_flextable_defaults(
+  split=F, table_align="center", table.layout="autofit"); read_docx() %>%
+  body_add_flextable(value=tab_CHARLS) %>%
+  print(target = "Tables/TableS1_5CHARLS.docx")
 
 
 ####-------------------------------- METRIC PERFORMANCE -----------#### ----####
-#Uno's c-statistic----- ####
+#Tab 1: Seq cox + AUC-- ####
+
+#Data management
+pooled_roc <- pooled %>% filter(
+  !is.na(Education), !is.na(Smoking), !is.na(Drinking), !is.na(n_comorb))
+pooled_roc$TTDM_c <- pmin(pooled_roc$TTDM, 120)  #Censor at 10 years
+pooled_roc$mortstat2_c <- ifelse(pooled_roc$TTDM>120, 0, pooled_roc$mortstat2) 
+
+#Adjustment level 1
+m1_p0 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(Age)+strata(Sex)+
+    strata(Ethnicity2)+strata(coh),weights=std_weights, data=pooled_roc, x=T)
+m1_p1 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(AnthropoAge)+scale(Age)+strata(Sex)+
+    strata(Ethnicity2)+strata(coh),weights=std_weights, data=pooled_roc, x=T)
+m1_p2 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(AnthropoAgeAccel)+scale(Age)+strata(Sex)+
+    strata(Ethnicity2)+strata(coh),weights=std_weights, data=pooled_roc, x=T)
+m1_p3 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(BRI)+scale(Age)+strata(Sex)+
+    strata(Ethnicity2)+strata(coh),weights=std_weights, data=pooled_roc, x=T)
+m1_p4 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(WWI)+scale(Age)+strata(Sex)+
+    strata(Ethnicity2)+strata(coh),weights=std_weights, data=pooled_roc, x=T)
+m1_p5 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(ABSI)+scale(Age)+strata(Sex)+
+    strata(Ethnicity2)+strata(coh),weights=std_weights, data=pooled_roc, x=T)
+
+#Adjustment level 2
+m2_p0 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(Age)+strata(Sex)+
+    Education+Smoking+Drinking+
+    strata(Ethnicity2)+strata(coh),weights=std_weights, data=pooled_roc, x=T)
+m2_p1 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(AnthropoAge)+scale(Age)+strata(Sex)+
+    Education+Smoking+Drinking+
+    strata(Ethnicity2)+strata(coh),weights=std_weights, data=pooled_roc, x=T)
+m2_p2 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(AnthropoAgeAccel)+scale(Age)+strata(Sex)+
+    Education+Smoking+Drinking+
+    strata(Ethnicity2)+strata(coh),weights=std_weights, data=pooled_roc, x=T)
+m2_p3 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(BRI)+scale(Age)+strata(Sex)+
+    Education+Smoking+Drinking+
+    strata(Ethnicity2)+strata(coh),weights=std_weights, data=pooled_roc, x=T)
+m2_p4 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(WWI)+scale(Age)+strata(Sex)+
+    Education+Smoking+Drinking+
+    strata(Ethnicity2)+strata(coh),weights=std_weights, data=pooled_roc, x=T)
+m2_p5 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(ABSI)+scale(Age)+strata(Sex)+
+    Education+Smoking+Drinking+
+    strata(Ethnicity2)+strata(coh),weights=std_weights, data=pooled_roc, x=T)
+
+#Adjustment level 4
+m3_p0 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(Age)+strata(Sex)+
+    Education+Smoking+Drinking+n_comorb+
+    strata(Ethnicity2)+strata(coh),weights=std_weights, data=pooled_roc, x=T)
+m3_p1 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(AnthropoAge)+scale(Age)+strata(Sex)+
+    Education+Smoking+Drinking+n_comorb+
+    strata(Ethnicity2)+strata(coh),weights=std_weights, data=pooled_roc, x=T)
+m3_p2 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(AnthropoAgeAccel)+scale(Age)+strata(Sex)+
+    Education+Smoking+Drinking+n_comorb+
+    strata(Ethnicity2)+strata(coh),weights=std_weights, data=pooled_roc, x=T)
+m3_p3 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(BRI)+scale(Age)+strata(Sex)+
+    Education+Smoking+Drinking+n_comorb+
+    strata(Ethnicity2)+strata(coh),weights=std_weights, data=pooled_roc, x=T)
+m3_p4 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(WWI)+scale(Age)+strata(Sex)+
+    Education+Smoking+Drinking+n_comorb+
+    strata(Ethnicity2)+strata(coh), data=pooled_roc, x=T)
+m3_p5 <- coxph(
+  Surv(TTDM_c, mortstat2_c) ~ scale(ABSI)+scale(Age)+strata(Sex)+
+    Education+Smoking+Drinking+n_comorb+
+    strata(Ethnicity2)+strata(coh), data=pooled_roc, x=T)
+
+#ROC
+r1.0<-pROC::roc(pooled_roc$mortstat2_c, m1_p0$linear.predictors, ci=T)## M1
+r1.1<-pROC::roc(pooled_roc$mortstat2_c, m1_p1$linear.predictors, ci=T)
+r1.2<-pROC::roc(pooled_roc$mortstat2_c, m1_p2$linear.predictors, ci=T)
+r1.3<-pROC::roc(pooled_roc$mortstat2_c, m1_p3$linear.predictors, ci=T)
+r1.4<-pROC::roc(pooled_roc$mortstat2_c, m1_p4$linear.predictors, ci=T)
+r1.5<-pROC::roc(pooled_roc$mortstat2_c, m1_p5$linear.predictors, ci=T)
+r2.0<-pROC::roc(pooled_roc$mortstat2_c, m2_p0$linear.predictors, ci=T)## M2
+r2.1<-pROC::roc(pooled_roc$mortstat2_c, m2_p1$linear.predictors, ci=T)
+r2.2<-pROC::roc(pooled_roc$mortstat2_c, m2_p2$linear.predictors, ci=T)
+r2.3<-pROC::roc(pooled_roc$mortstat2_c, m2_p3$linear.predictors, ci=T)
+r2.4<-pROC::roc(pooled_roc$mortstat2_c, m2_p4$linear.predictors, ci=T)
+r2.5<-pROC::roc(pooled_roc$mortstat2_c, m2_p5$linear.predictors, ci=T)
+r3.0<-pROC::roc(pooled_roc$mortstat2_c, m3_p0$linear.predictors, ci=T)## M3
+r3.1<-pROC::roc(pooled_roc$mortstat2_c, m3_p1$linear.predictors, ci=T)
+r3.2<-pROC::roc(pooled_roc$mortstat2_c, m3_p2$linear.predictors, ci=T)
+r3.3<-pROC::roc(pooled_roc$mortstat2_c, m3_p3$linear.predictors, ci=T)
+r3.4<-pROC::roc(pooled_roc$mortstat2_c, m3_p4$linear.predictors, ci=T)
+r3.5<-pROC::roc(pooled_roc$mortstat2_c, m3_p5$linear.predictors, ci=T)
+
+set_flextable_defaults(font.size = 9, font.family = "Arial",
+                       table.layout="autofit", split=F, table_align="center")
+cbind(
+  "Predictor"=c("CA alone", "CA + AnthropoAgeAccel",
+                "CA + BRI", "CA + WWI", "CA + ABSI"),
+  rbind(
+    summary(m1_p0)$conf.int[1,c(1,3:4)], summary(m1_p2)$conf.int[1,c(1,3:4)],
+    summary(m1_p3)$conf.int[1,c(1,3:4)], summary(m1_p4)$conf.int[1,c(1,3:4)],
+    summary(m1_p5)$conf.int[1,c(1,3:4)]) %>% apply(2,sprintf,fmt="%#.2f") %>%
+    as.data.frame %>% `colnames<-`(LETTERS[1:3]) %>%
+    transmute(paste0(A,"\n(",B,"-",C,")")) %>%
+    `colnames<-`(c("Model1.HR (95% CI)")),
+  rbind(r1.0$ci[c(2,1,3)], r1.2$ci[c(2,1,3)], r1.3$ci[c(2,1,3)],
+        r1.4$ci[c(2,1,3)], r1.5$ci[c(2,1,3)]) %>%
+    apply(2, sprintf, fmt="%#.3f") %>% as.data.frame %>% 
+    transmute(paste0(V1, "\n(", V2, "-", V3, ")")) %>%
+    `colnames<-`(c("Model1.AUROC (95% CI)")),
+  rbind(
+    summary(m2_p0)$conf.int[1,c(1,3:4)], summary(m2_p2)$conf.int[1,c(1,3:4)],
+    summary(m2_p3)$conf.int[1,c(1,3:4)], summary(m2_p4)$conf.int[1,c(1,3:4)],
+    summary(m2_p5)$conf.int[1,c(1,3:4)]) %>% apply(2,sprintf,fmt="%#.2f") %>%
+    as.data.frame %>% `colnames<-`(LETTERS[1:3]) %>%
+    transmute(paste0(A,"\n(",B,"-",C,")")) %>%
+    `colnames<-`(c("Model2.HR (95% CI)")),
+  rbind(r2.0$ci[c(2,1,3)], r2.2$ci[c(2,1,3)], r2.3$ci[c(2,1,3)],
+        r2.4$ci[c(2,1,3)], r2.5$ci[c(2,1,3)]) %>%
+    apply(2, sprintf, fmt="%#.3f") %>% as.data.frame %>% 
+    transmute(paste0(V1, "\n(", V2, "-", V3, ")")) %>%
+    `colnames<-`(c("Model2.AUROC (95% CI)")),
+  rbind(
+    summary(m3_p0)$conf.int[1,c(1,3:4)], summary(m3_p2)$conf.int[1,c(1,3:4)],
+    summary(m3_p3)$conf.int[1,c(1,3:4)], summary(m3_p4)$conf.int[1,c(1,3:4)],
+    summary(m3_p5)$conf.int[1,c(1,3:4)]) %>% apply(2,sprintf,fmt="%#.2f") %>%
+    as.data.frame %>% `colnames<-`(LETTERS[1:3]) %>%
+    transmute(paste0(A,"\n(",B,"-",C,")")) %>%
+    `colnames<-`(c("Model3.HR (95% CI)")),
+  rbind(r3.0$ci[c(2,1,3)], r3.2$ci[c(2,1,3)], r3.3$ci[c(2,1,3)],
+        r3.4$ci[c(2,1,3)], r3.5$ci[c(2,1,3)]) %>%
+    apply(2, sprintf, fmt="%#.3f") %>% as.data.frame %>% 
+    transmute(paste0(V1, "\n(", V2, "-", V3, ")")) %>%
+    `colnames<-`(c("Model3.AUROC (95% CI)"))) %>% flextable() %>%
+  separate_header(opts = c("span-top", "bottom-vspan", "center-hspan")) %>% 
+  bold(part="header") %>% italic(j=1, part="body") %>%
+  align(align="center", part="header") -> tab1fin
+
+set_flextable_defaults(
+  split=F, table_align="center", table.layout="autofit"); read_docx() %>%
+  body_add_flextable(value=tab1fin) %>% print(target="Tables/Table1_AUC.docx")
+
+
+#Differences
+#roc.test(r1.2, r1.0, method = "boot") #D = 11.949, p-value < 2.2e-16
+#roc.test(r1.2, r1.3, method = "boot") #D = 11.95, p-value < 2.2e-16
+#roc.test(r1.2, r1.4, method = "boot") #D = 7.4122, p-value = 1.242e-13
+#roc.test(r1.2, r1.5, method = "boot") #D = 1.4195, p-value = 0.1558
+
+#roc.test(r2.2, r2.0, method = "boot") #D = 9.7535, p-value < 2.2e-16
+#roc.test(r2.2, r2.3, method = "boot") #D = 8.9284, p-value < 2.2e-16
+#roc.test(r2.2, r2.4, method = "boot") #D = 6.6163, p-value = 3.683e-11
+#roc.test(r2.2, r2.5, method = "boot") #D = 2.3677, p-value = 0.0179
+
+#roc.test(r3.2, r3.0, method = "boot") #D = 7.4755, p-value = 7.693e-14
+#roc.test(r3.2, r3.3, method = "boot") #D = 6.923, p-value = 4.422e-12
+#roc.test(r3.2, r3.4, method = "boot") #D = 5.7982, p-value = 6.703e-09
+#roc.test(r3.2, r3.5, method = "boot") #D = -0.52917, p-value = 0.5967 #DANG
+
+
+#Uno c-statistic + HR-- ####
 strat.unoc <- function(x){
   #AnthropoAge
   a <- x %>% group_by(Q5) %>% summarise(
     "c"=concordance(
-      Surv(TTDM, mortstat2) ~ AnthropoAge+strata(Sex)+strata(Ethnicity),
+      Surv(TTDM, mortstat2) ~ AnthropoAge+
+        strata(Sex)+strata(Ethnicity),
       reverse = TRUE,timewt = "n/G2", weights=std_weights)$concordance,
     "c_var"=concordance(
-      Surv(TTDM, mortstat2) ~ AnthropoAge+strata(Sex)+strata(Ethnicity),
+      Surv(TTDM, mortstat2) ~ AnthropoAge+
+        strata(Sex)+strata(Ethnicity),
       reverse = TRUE,timewt = "n/G2", weights=std_weights)$var,
     "c_l"=c - sqrt(c_var)*qnorm(0.975), "c_u"=c + sqrt(c_var)*qnorm(0.975),
     "Par"="AnthropoAge") %>% select(Q5, c, c_l, c_u, Par)
   #Age
   b <- x %>% group_by(Q5) %>% summarise(
     "c"=concordance(
-      Surv(TTDM, mortstat2) ~ Age+strata(Sex)+strata(Ethnicity),
+      Surv(TTDM, mortstat2) ~ Age+
+        strata(Sex)+strata(Ethnicity),
       reverse = TRUE,timewt = "n/G2", weights=std_weights)$concordance,
     "c_var"=concordance(
-      Surv(TTDM, mortstat2) ~ Age+strata(Sex)+strata(Ethnicity),
+      Surv(TTDM, mortstat2) ~ Age+
+        strata(Sex)+strata(Ethnicity),
       reverse = TRUE,timewt = "n/G2", weights=std_weights)$var,
     "c_l"=c - sqrt(c_var)*qnorm(0.975), "c_u"=c + sqrt(c_var)*qnorm(0.975),
     "Par"="Age") %>% select(Q5, c, c_l, c_u, Par)
-  rbind(a,b)}
+  #BRI
+  c <- x %>% group_by(Q5) %>% summarise(
+    "c"=concordance(
+      Surv(TTDM, mortstat2) ~ BRI+
+        strata(Sex)+strata(Ethnicity),
+      reverse = TRUE,timewt = "n/G2", weights=std_weights)$concordance,
+    "c_var"=concordance(
+      Surv(TTDM, mortstat2) ~ BRI+
+        strata(Sex)+strata(Ethnicity),
+      reverse = TRUE,timewt = "n/G2", weights=std_weights)$var,
+    "c_l"=c - sqrt(c_var)*qnorm(0.975), "c_u"=c + sqrt(c_var)*qnorm(0.975),
+    "Par"="BRI") %>% select(Q5, c, c_l, c_u, Par)
+  #WWI
+  d <- x %>% group_by(Q5) %>% summarise(
+    "c"=concordance(
+      Surv(TTDM, mortstat2) ~ WWI+
+        strata(Sex)+strata(Ethnicity),
+      reverse = TRUE,timewt = "n/G2", weights=std_weights)$concordance,
+    "c_var"=concordance(
+      Surv(TTDM, mortstat2) ~ WWI+
+        strata(Sex)+strata(Ethnicity),
+      reverse = TRUE,timewt = "n/G2", weights=std_weights)$var,
+    "c_l"=c - sqrt(c_var)*qnorm(0.975), "c_u"=c + sqrt(c_var)*qnorm(0.975),
+    "Par"="WWI") %>% select(Q5, c, c_l, c_u, Par)
+  #ABSI
+  e <- x %>% group_by(Q5) %>% summarise(
+    "c"=concordance(
+      Surv(TTDM, mortstat2) ~ ABSI+
+        strata(Sex)+strata(Ethnicity),
+      reverse = TRUE,timewt = "n/G2", weights=std_weights)$concordance,
+    "c_var"=concordance(
+      Surv(TTDM, mortstat2) ~ ABSI+
+        strata(Sex)+strata(Ethnicity),
+      reverse = TRUE,timewt = "n/G2", weights=std_weights)$var,
+    "c_l"=c - sqrt(c_var)*qnorm(0.975), "c_u"=c + sqrt(c_var)*qnorm(0.975),
+    "Par"="ABSI") %>% select(Q5, c, c_l, c_u, Par)
+  rbind(a,b,c,d,e)}
 evpergroup <- function(x,y){
   ev1 <- (x %>% select(Q5, mortstat2) %>% table)[,2]
   ev2 <- (x %>% select(Q5, mortstat2) %>% table %>% prop.table(1))[,2]
@@ -1138,26 +1796,41 @@ evpergroup <- function(x,y){
     y,"=",ev1," (",round(ev2*100,1),"%)") %>% paste(collapse = ", "),".")
   ev}
 
+#HR
+(with(pooled, coxph(
+  Surv(TTDM, mortstat2) ~ scale(AnthropoAge)+scale(Age)+strata(Sex)+
+    strata(Ethnicity2)+strata(coh), weights=std_weights)) %>%
+    summary)$conf.int[1,c(1,3:4)] %>% round(2)
+
 ## Overall
 c1 <- with(pooled, concordance(
-  Surv(TTDM, mortstat2) ~ AnthropoAge+strata(Sex)+strata(Ethnicity),
+  Surv(TTDM, mortstat2) ~ AnthropoAge +
+    strata(Sex)+strata(Ethnicity),
   reverse = T, weights=std_weights, timewt = "n/G2"))
 c2 <- with(pooled, concordance(
-  Surv(TTDM, mortstat2) ~ Age+strata(Sex)+strata(Ethnicity),
+  Surv(TTDM, mortstat2) ~ Age+
+    strata(Sex)+strata(Ethnicity),
   reverse = T, weights=std_weights, timewt = "n/G2"))
-c(c1$concordance, c1$concordance + (c(-1,1)*sqrt(c1$var)*qnorm(0.975)))
-c(c2$concordance, c2$concordance + (c(-1,1)*sqrt(c2$var)*qnorm(0.975)))
+
+rbind(
+  c(c1$concordance, c1$concordance + (c(-1,1)*sqrt(c1$var)*qnorm(0.975))),
+  c(c2$concordance, c2$concordance + (c(-1,1)*sqrt(c2$var)*qnorm(0.975)))
+  ) %>% round(3)
+
 
 ## By G2A study
 pooled %>% mutate("Q5"=G2ASTUDY) %>% strat.unoc %>%
-  mutate("Q5"=reorder(Q5, -c)) %>% 
+  mutate("Par"=ordered(Par, levels=c("BRI","WWI","ABSI","Age","AnthropoAge")),
+         "Q5"=reorder(Q5, -c)) %>% 
   ggplot(aes(x=Q5, y=c, group=Par, fill=Par, ymin=c_l, ymax=c_u)) +
   geom_crossbar(position = position_dodge2(), width=0.3, alpha=0.85) +
-  scale_fill_manual(values = c("#9683ec","#35034f")) +
-  theme_pubclean() + geom_hline(yintercept = 0.5, linetype=2) +
-  scale_y_continuous(breaks=seq(.2,1,0.15), limits = c(0.3,1))+ labs(
-    x="G2A study", y="c-statistic (95% CI)", fill="Predictor") + 
-  theme(legend.position = "top", plot.title = element_text(
+  scale_fill_manual(values = c("#f4a4ac","#ffb600","#d92b3a",
+                               "#9683ec","#35034f")) +
+  theme_bw() + geom_hline(yintercept = 0.5, linetype=2) +
+  scale_y_continuous(breaks=seq(.5,.9,.1), limits = c(0.485,0.9))+ labs(
+    x="G2A study", y="c-statistic (95% CI)", fill="Predictor",
+    title="Uno's c-statistic for all-cause mortality") + 
+  theme(legend.position = "bottom", plot.title = element_text(
     hjust=0.5, face="bold")) -> Fig2a; Fig2a
 #Events per group
 pooled %>% mutate("Q5"=G2ASTUDY) %>%
@@ -1166,10 +1839,12 @@ pooled %>% mutate("Q5"=G2ASTUDY) %>%
 ## By Ethnicity
 pooled %>% filter(Ethnicity2!="US-Other") %>%
   mutate("Q5"=Ethnicity) %>% strat.unoc %>%
-  mutate("Q5"=reorder(Q5, -c)) %>% 
+  mutate("Par"=ordered(Par, levels=c("BRI","WWI","ABSI","Age","AnthropoAge")),
+         "Q5"=reorder(Q5, -c))  %>% 
   ggplot(aes(x=Q5, y=c, group=Par, fill=Par, ymin=c_l, ymax=c_u)) +
   geom_crossbar(position = position_dodge2(), width=0.3, alpha=0.85) +
-  scale_fill_manual(values = c("#9683ec","#35034f")) +
+  scale_fill_manual(values = c("#f4a4ac","#ffb600","#d92b3a",
+                               "#9683ec","#35034f")) +
   theme_pubclean() + geom_hline(yintercept = 0.5, linetype=5) +
   scale_y_continuous(breaks=seq(.2,1,0.15), limits = c(0.3,1)) + labs(
     x="Race/ethnicity", y="c-statistic (95% CI)", fill="Predictor") + 
@@ -1179,40 +1854,37 @@ pooled %>% filter(Ethnicity2!="US-Other") %>%
 pooled %>% filter(Ethnicity2!="US-Other") %>% mutate("Q5"=Ethnicity) %>%
   evpergroup(y=levels(pooled$Ethnicity)) -> ev_Eth
 
+#With repeated measures
+G2A_mega0_1<-rbind(
+  G2A_mega0 %>% filter(mortstat2==0),
+  G2A_mega0 %>% filter(mortstat2==1) %>% group_by(ID) %>%
+    filter(!(year==max(year))) %>%  ungroup() %>% mutate(mortstat2=0),
+  G2A_mega0 %>% filter(mortstat2==1) %>% group_by(ID) %>%
+    filter((year==max(year)))%>% ungroup())
 
-#Time-dependent AUC---- ####
-### Overall sample
-pooled$years<-pooled$TTDM/12
-m1 <- coxph(Surv(years,mortstat2)~ Age+strata(Sex)+
-              strata(Ethnicity), data=pooled, y=TRUE, x=TRUE)
-m2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+strata(Sex)+
-              strata(Ethnicity), data=pooled, y=TRUE, x=TRUE)
-
-follow <- 13; ROC.df.1 <- Score(
-  list("Age"=m1, "AnthropoAge"=m2), formula=Hist(years,mortstat2)~1,
-  data=pooled, conf.int=T, cens.method = "ipcw", summary="risks",
-  metrics="auc", plots="roc", times = c(seq(1, follow, 1)))
-
-Fig2c <- autoplot(ROC.df.1, conf.int=T, ylim=c(0.7,0.8), lwd = 1.2) +
-  theme_pubclean() + theme(legend.position = "top") +
-  scale_color_manual(values = c("#9683ec","#35034f")) +
-  scale_fill_manual(values = c("#9683ec","#35034f")) +
-  labs(fill="Marker", col="Marker", y="tAUC (95%CI)",
-       x="Years of follow-up"); Fig2c
-
-Fig2d <- as.data.frame(ROC.df.1$AUC$contrasts) %>%
-  ggplot(aes(y=delta.AUC, x=times)) + geom_point() + geom_line() +
-  geom_ribbon(aes(ymin=lower, ymax=upper),alpha=0.2) +
-  labs(y="Delta tAUC of AnthropoAge - CA", x="Years of follow-up")+
-  theme_pubclean() + geom_hline(yintercept = 0, linetype=5); Fig2d
+with(G2A_mega0_1, coxph(
+  Surv(TTDM, mortstat2) ~ (AnthropoAge)+strata(Sex)+
+    strata(Ethnicity2)+strata(coh)+cluster(ID),
+  weights=std_weights)) %>% summary -> cl1
+with(G2A_mega0_1, coxph(
+  Surv(TTDM, mortstat2) ~ (Age)+strata(Sex)+
+    strata(Ethnicity2)+strata(coh)+cluster(ID),
+  weights=std_weights)) %>% summary -> cl2
+cclust0 <- rbind(
+  c(cl1$conc[1], cl1$conc[1]+c(-1,1)*cl1$conc[2]*qnorm(.975)) %>% round(3),
+  c(cl2$conc[1], cl2$conc[1]+c(-1,1)*cl2$conc[2]*qnorm(.975)) %>% round(3))
+cclust0
 
 
 #Stratified c---------- ####
 ## By age quintiles
 pooled %>% mutate("Q5"=Age %>% quantcut(seq(0,1,0.2))) %>% strat.unoc %>%
+  mutate("Par"=ordered(Par, levels=c("BRI","WWI","ABSI","Age","AnthropoAge")),
+         "Q5"=reorder(Q5, -c)) %>% 
   ggplot(aes(x=Q5, y=c, group=Par, fill=Par, ymin=c_l, ymax=c_u)) +
   geom_crossbar(position = position_dodge2(), width=0.3, alpha=0.85) +
-  scale_fill_manual(values = c("#9683ec","#35034f")) +
+  scale_fill_manual(values = c("#f4a4ac","#ffb600","#d92b3a",
+                               "#9683ec","#35034f")) +
   theme_pubclean() + geom_hline(yintercept = 0.5, linetype=5) +
   scale_y_continuous(breaks=seq(.2,1,0.15), limits = c(0.3,1)) + labs(
     x="Age quintile (years)", y="c-statistic (95% CI)", fill="Predictor") + 
@@ -1223,10 +1895,13 @@ pooled %>% mutate("Q5"=Age %>% quantcut(seq(0,1,0.2))) %>%
   evpergroup(y=paste0("Q",1:5)) -> ev_Age
 
 ## By BMI quintiles
-pooled %>% mutate("Q5"=BMI %>% quantcut(seq(0,1,0.2))) %>% strat.unoc %>%
+pooled %>% mutate("Q5"=BMI %>% quantcut(seq(0,1,0.2))) %>% strat.unoc %>% 
+  mutate("Par"=ordered(Par, levels=c("BRI","WWI","ABSI","Age","AnthropoAge")),
+         "Q5"=reorder(Q5, -c)) %>% 
   ggplot(aes(x=Q5, y=c, group=Par, fill=Par, ymin=c_l, ymax=c_u)) +
   geom_crossbar(position = position_dodge2(), width=0.3, alpha=0.85) +
-  scale_fill_manual(values = c("#9683ec","#35034f")) +
+  scale_fill_manual(values = c("#f4a4ac","#ffb600","#d92b3a",
+                               "#9683ec","#35034f")) +
   theme_pubclean() + geom_hline(yintercept = 0.5, linetype=5) +
   scale_y_continuous(breaks=seq(.2,1,0.15), limits = c(0.3,1)) + labs(
     x="BMI quintile (kg/m^2)", y="c-statistic (95% CI)", fill="Predictor") + 
@@ -1238,10 +1913,13 @@ pooled %>% mutate("Q5"=BMI %>% quantcut(seq(0,1,0.2))) %>%
 
 ## By WHtR quintiles
 pooled %>% mutate("Q5"=ICE %>% round(2) %>% quantcut(seq(0,1,0.2))) %>%
-  strat.unoc %>%
+  strat.unoc  %>%
+  mutate("Par"=ordered(Par, levels=c("BRI","WWI","ABSI","Age","AnthropoAge")),
+         "Q5"=reorder(Q5, -c)) %>% 
   ggplot(aes(x=Q5, y=c, group=Par, fill=Par, ymin=c_l, ymax=c_u)) +
   geom_crossbar(position = position_dodge2(), width=0.3, alpha=0.85) +
-  scale_fill_manual(values = c("#9683ec","#35034f")) +
+  scale_fill_manual(values = c("#f4a4ac","#ffb600","#d92b3a",
+                               "#9683ec","#35034f")) +
   theme_pubclean() + geom_hline(yintercept = 0.5, linetype=5) +
   scale_y_continuous(breaks=seq(.2,1,0.15), limits = c(0.3,1)) + labs(
     x="WHtR quintile", y="c-statistic (95% CI)", fill="Predictor") + 
@@ -1252,10 +1930,13 @@ pooled %>% mutate("Q5"=ICE %>% quantcut(seq(0,1,0.2))) %>%
   evpergroup(y=paste0("Q",1:5)) -> ev_ICE
 
 ## By Sex
-pooled %>% mutate("Q5"=Sex) %>% strat.unoc %>%
+pooled %>% mutate("Q5"=Sex) %>% strat.unoc  %>%
+  mutate("Par"=ordered(Par, levels=c("BRI","WWI","ABSI","Age","AnthropoAge")),
+         "Q5"=reorder(Q5, -c)) %>% 
   ggplot(aes(x=Q5, y=c, group=Par, fill=Par, ymin=c_l, ymax=c_u)) +
   geom_crossbar(position = position_dodge2(), width=0.3, alpha=0.85) +
-  scale_fill_manual(values = c("#9683ec","#35034f")) +
+  scale_fill_manual(values = c("#f4a4ac","#ffb600","#d92b3a",
+                               "#9683ec","#35034f")) +
   theme_pubclean() + geom_hline(yintercept = 0.5, linetype=5) +
   scale_y_continuous(breaks=seq(.2,1,0.15), limits = c(0.3,1)) + labs(
     x="Sex", y="c-statistic (95% CI)", fill="Predictor") + 
@@ -1267,9 +1948,12 @@ pooled %>% mutate("Q5"=Sex) %>% evpergroup(y=c("Men","Women")) -> ev_Sex
 ## By number of comorbidities
 pooled %>% mutate("Q5"=n_comorb %>% cut(c(-Inf,0,1,Inf)) %>% factor(
   labels=c("0","1","≥2"))) %>% strat.unoc %>%
+  mutate("Par"=ordered(Par, levels=c("BRI","WWI","ABSI","Age","AnthropoAge")),
+         "Q5"=reorder(Q5, -c)) %>% 
   ggplot(aes(x=Q5, y=c, group=Par, fill=Par, ymin=c_l, ymax=c_u)) +
   geom_crossbar(position = position_dodge2(), width=0.3, alpha=0.85) +
-  scale_fill_manual(values = c("#9683ec","#35034f")) +
+  scale_fill_manual(values = c("#f4a4ac","#ffb600","#d92b3a",
+                               "#9683ec","#35034f")) +
   theme_pubclean() + geom_hline(yintercept = 0.5, linetype=5) +
   scale_y_continuous(breaks=seq(.2,1,0.15), limits = c(0.3,1)) + labs(
     x="Number of comorbidities",
@@ -1287,13 +1971,90 @@ ev_Sex
 ev_MMB
 
 
+#Time-dependent AUC---- ####
+pooled$years<-pooled$TTDM/12
+
+### Overall
+m1 <- coxph(Surv(years,mortstat2)~ Age+strata(Sex)+
+              strata(Ethnicity), data=pooled, y=TRUE, x=TRUE)
+m2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+strata(Sex)+
+              strata(Ethnicity), data=pooled, y=TRUE, x=TRUE)
+m3 <- coxph(Surv(years,mortstat2)~ BRI+strata(Sex)+
+              strata(Ethnicity), data=pooled, y=TRUE, x=TRUE)
+m4 <- coxph(Surv(years,mortstat2)~ WWI+strata(Sex)+
+              strata(Ethnicity), data=pooled, y=TRUE, x=TRUE)
+m5 <- coxph(Surv(years,mortstat2)~ ABSI+strata(Sex)+
+              strata(Ethnicity), data=pooled, y=TRUE, x=TRUE)
+
+follow <- 8; ROC.df.1 <- Score(
+  list("BRI"=m3, "WWI"=m4, "ABSI"=m5,
+       "Age"=m1, "AnthropoAge"=m2), formula=Hist(years,mortstat2)~1,
+  data=pooled, conf.int=T, cens.method="ipcw", summary="risks",
+  metrics="auc", plots="roc", times = c(seq(1,follow,1),8.5))
+Fig2c <- autoplot(ROC.df.1, conf.int=T,
+                  ylim=c(0.5,0.8), xlim=c(1,8.5), lwd = 1.2) +
+  theme_bw() + theme(legend.position = "top") +
+  scale_color_manual(values=c("#f4a4ac","#ffb600","#d92b3a","#9683ec","#35034f")) +
+  scale_fill_manual(values=c("#f4a4ac","#ffb600","#d92b3a","#9683ec","#35034f")) +
+  labs(fill="Predictor", col="Predictor", y="tAUC (95%CI)",
+       x="Years of follow-up", title="tAUC for all-cause mortality") +
+  theme(plot.title = element_text(hjust=0.5, vjust=0, face="bold")); Fig2c
+Fig2d <- as.data.frame(ROC.df.1$AUC$contrasts) %>%
+  filter(model=="AnthropoAge", reference=="Age") %>% 
+  ggplot(aes(y=delta.AUC, x=times)) + geom_point() + geom_line() +
+  geom_ribbon(aes(ymin=lower, ymax=upper),alpha=0.2) +
+  labs(y="Delta tAUC", x="Years of follow-up",
+       title="Delta tAUC (AnthropoAge - CA)")+
+  ggbreak::scale_y_break(breaks = c(0.0025,0.0075), space=0.05, scales=10) +
+  scale_y_continuous(breaks=c(0,0.0075,0.01,0.0125,0.015,0.0175),
+                     limits=c(-0.0025, 0.018))+ 
+  theme_bw() + geom_hline(yintercept = 0, linetype=5)+ theme(
+    plot.title = element_text(hjust=0.5, face="bold"),
+    axis.line.y.right=element_blank(), axis.ticks.y.right=element_blank(),
+    axis.text.y.right=element_blank()); Fig2d
+
+### Follow-up time 8-13 years
+pooled_f2 <- pooled %>% filter(years>7)
+m1.f2 <- coxph(Surv(years,mortstat2)~ Age+strata(Sex)+
+                 strata(Ethnicity), data=pooled_f2, y=TRUE, x=TRUE)
+m2.f2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+strata(Sex)+
+                 strata(Ethnicity), data=pooled_f2, y=TRUE, x=TRUE)
+m3.f2 <- coxph(Surv(years,mortstat2)~ BRI+strata(Sex)+
+                 strata(Ethnicity), data=pooled_f2, y=TRUE, x=TRUE)
+m4.f2 <- coxph(Surv(years,mortstat2)~ WWI+strata(Sex)+
+                 strata(Ethnicity), data=pooled_f2, y=TRUE, x=TRUE)
+m5.f2 <- coxph(Surv(years,mortstat2)~ ABSI+strata(Sex)+
+                 strata(Ethnicity), data=pooled_f2, y=TRUE, x=TRUE)
+
+follow <- 14; ROC.f2 <- Score(
+  list("Age"=m1.f2, "AnthropoAge"=m2.f2, "BRI"=m3.f2,
+       "WWI"=m4.f2, "ABSI"=m5.f2), formula=Hist(years,mortstat2)~1,
+  data=pooled_f2, conf.int=T, cens.method = "ipcw", summary="risks",
+  metrics="auc", plots="roc", times = c(seq(1, follow, 1)))
+FS_Xc <- autoplot(ROC.f2, ylim = c(0.5,0.85), xlim = c(10,14),
+                  conf.int=T, lwd = 1.2) +
+  theme_pubclean() + theme(legend.position = "top") +
+  scale_color_manual(values=c("#9683ec","#35034f","#f4a4ac","#ffb600","#d92b3a")) +
+  scale_fill_manual(values=c("#9683ec","#35034f","#f4a4ac","#ffb600","#d92b3a")) +
+  labs(fill="Marker", col="Marker", y="tAUC (95%CI)",
+       x="Years of follow-up"); FS_Xc
+FS_Xd <- as.data.frame(ROC.f2$AUC$contrasts) %>%
+  filter(model=="AnthropoAge") %>% 
+  ggplot(aes(y=delta.AUC, x=times)) + geom_point() + geom_line() +
+  geom_ribbon(aes(ymin=lower, ymax=upper),alpha=0.2) +
+  labs(y="Delta tAUC of AnthropoAge - CA", x="Years of follow-up")+ xlim(8,14)+
+  theme_pubclean() + geom_hline(yintercept = 0, linetype=5); FS_Xd
+ggarrange(FS_Xc, FS_Xd)
+
+
+
 #Stratified tAUC------- ####
 ### HRS
 HRS.A1_BX$years<-HRS.A1_BX$TTDM/12
-m1 <- coxph(Surv(years,mortstat2)~ Age+strata(Sex)+
-              strata(Ethnicity), data=HRS.A1_BX, y=TRUE, x=TRUE)
-m2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+strata(Sex)+
-              strata(Ethnicity), data=HRS.A1_BX, y=TRUE, x=TRUE)
+m1 <- coxph(Surv(years,mortstat2)~ Age+strata(Sex)+strata(Ethnicity),
+            data=HRS.A1_BX, y=TRUE, x=TRUE)
+m2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+strata(Sex)+strata(Ethnicity),
+            data=HRS.A1_BX, y=TRUE, x=TRUE)
 follow <- 13; ROC.HRS <- Score(
   list("Age"=m1, "AnthropoAge"=m2), formula=Hist(years,mortstat2)~1,
   data=HRS.A1_BX, conf.int=T, cens.method = "ipcw", summary="risks",
@@ -1302,10 +2063,10 @@ data.HRS<-as.data.frame(ROC.HRS$AUC$contrasts)
 
 ### ELSA
 ELSA.A1_BX$years<-ELSA.A1_BX$TTDM/12
-m1 <- coxph(Surv(years,mortstat2)~ Age+strata(Sex)+
-              strata(Ethnicity), data=ELSA.A1_BX, y=TRUE, x=TRUE)
-m2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+strata(Sex)+
-              strata(Ethnicity), data=ELSA.A1_BX, y=TRUE, x=TRUE)
+m1 <- coxph(Surv(years,mortstat2)~ Age+strata(Sex)+strata(Ethnicity2),
+            data=ELSA.A1_BX, y=TRUE, x=TRUE)
+m2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+strata(Sex)+strata(Ethnicity2),
+            data=ELSA.A1_BX, y=TRUE, x=TRUE)
 follow <- 13; ROC.ELSA <- Score(
   list("Age"=m1, "AnthropoAge"=m2), formula=Hist(years,mortstat2)~1,
   data=ELSA.A1_BX, conf.int=T, cens.method = "ipcw", summary="risks",
@@ -1314,10 +2075,10 @@ data.ELSA<-as.data.frame(ROC.ELSA$AUC$contrasts)
 
 ### MHAS
 MHAS.A1_BX$years<-MHAS.A1_BX$TTDM/12
-m1 <- coxph(Surv(years,mortstat2)~ Age+strata(Sex)+
-              strata(Ethnicity), data=MHAS.A1_BX, y=TRUE, x=TRUE)
-m2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+strata(Sex)+
-              strata(Ethnicity), data=MHAS.A1_BX, y=TRUE, x=TRUE)
+m1 <- coxph(Surv(years,mortstat2)~ Age+strata(Sex)+strata(Ethnicity2),
+            data=MHAS.A1_BX, y=TRUE, x=TRUE)
+m2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+strata(Sex)+strata(Ethnicity2),
+            data=MHAS.A1_BX, y=TRUE, x=TRUE)
 follow <- 13; ROC.MHAS <- Score(
   list("Age"=m1, "AnthropoAge"=m2), formula=Hist(years,mortstat2)~1,
   data=MHAS.A1_BX, conf.int=T, cens.method = "ipcw", summary="risks",
@@ -1326,10 +2087,10 @@ data.MHAS<-as.data.frame(ROC.MHAS$AUC$contrasts)
 
 ### CRELES
 CRELES.A1_BX$years<-CRELES.A1_BX$TTDM/12
-m1 <- coxph(Surv(years,mortstat2)~ Age+strata(Sex)+
-              strata(Ethnicity), data=CRELES.A1_BX, y=TRUE, x=TRUE)
-m2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+strata(Sex)+
-              strata(Ethnicity), data=CRELES.A1_BX, y=TRUE, x=TRUE)
+m1 <- coxph(Surv(years,mortstat2)~ Age+strata(Sex)+strata(Ethnicity2),
+            data=CRELES.A1_BX, y=TRUE, x=TRUE)
+m2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+strata(Sex)+strata(Ethnicity2),
+            data=CRELES.A1_BX, y=TRUE, x=TRUE)
 follow <- 13; ROC.CRELES <- Score(
   list("Age"=m1, "AnthropoAge"=m2), formula=Hist(years,mortstat2)~1,
   data=CRELES.A1_BX, conf.int=T, cens.method = "ipcw", summary="risks",
@@ -1338,10 +2099,10 @@ data.CRELES<-as.data.frame(ROC.CRELES$AUC$contrasts)
 
 ### CHARLS
 CHARLS.A1_BX$years<-CHARLS.A1_BX$TTDM/12
-m1 <- coxph(Surv(years,mortstat2)~ Age+strata(Sex)+
-              strata(Ethnicity), data=CHARLS.A1_BX, y=TRUE, x=TRUE)
-m2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+strata(Sex)+
-              strata(Ethnicity), data=CHARLS.A1_BX, y=TRUE, x=TRUE)
+m1 <- coxph(Surv(years,mortstat2)~ Age+strata(Sex)+strata(Ethnicity2),
+            data=CHARLS.A1_BX, y=TRUE, x=TRUE)
+m2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+strata(Sex)+strata(Ethnicity2),
+            data=CHARLS.A1_BX, y=TRUE, x=TRUE)
 follow <- 13; ROC.CHARLS <- Score(
   list("Age"=m1, "AnthropoAge"=m2), formula=Hist(years,mortstat2)~1,
   data=CHARLS.A1_BX, conf.int=T, cens.method = "ipcw", summary="risks",
@@ -1349,23 +2110,114 @@ follow <- 13; ROC.CHARLS <- Score(
 data.CHARLS<-as.data.frame(ROC.CHARLS$AUC$contrasts)
 
 
+#DCA------------------- ####
+## Run cox models ##
+dca.m0 <- coxph( #Baseline
+  Surv(TTDM, mortstat2) ~ Sex + Ethnicity2 + coh +
+    Education + Smoking + Drinking,
+  weights=std_weights, data=pooled, x=T)
+dca.m1 <- coxph( #Age
+  Surv(TTDM, mortstat2) ~ Age + Sex + Ethnicity2 + coh +
+    Education + Smoking + Drinking,
+  weights=std_weights, data=pooled, x=T)
+dca.m2 <- coxph(
+  Surv(TTDM, mortstat2) ~ AnthropoAge + Sex + Ethnicity2 + coh +
+    Education + Smoking + Drinking,
+  weights=std_weights, data=pooled, x=T)
+dca.m3 <- coxph(
+  Surv(TTDM, mortstat2) ~ BRI  + Sex + Ethnicity2 + coh +
+    Education + Smoking + Drinking,
+  weights=std_weights, data=pooled, x=T)
+dca.m4 <- coxph(
+  Surv(TTDM, mortstat2) ~ WWI  + Sex + Ethnicity2 + coh +
+    Education + Smoking + Drinking,
+  weights=std_weights, data=pooled, x=T)
+dca.m5 <- coxph(
+  Surv(TTDM, mortstat2) ~ ABSI  + Sex + Ethnicity2 + coh +
+    Education + Smoking + Drinking,
+  weights=std_weights, data=pooled, x=T)
+dca.m6 <- coxph(
+  Surv(TTDM, mortstat2) ~ Age + AnthropoAgeAccel + Sex + Ethnicity2 + coh +
+    Education + Smoking + Drinking,
+  weights=std_weights, data=pooled, x=T)
+
+pooled_dca <- pooled %>% filter(
+  !is.na(Education), !is.na(Smoking), !is.na(Drinking), !is.na(n_comorb)) %>%
+  mutate(
+  "dca0"=1-summary(survfit(dca.m0, newdata=pooled), times=120)$surv[1, ],
+  "dca1"=1-summary(survfit(dca.m1, newdata=pooled), times=120)$surv[1, ],
+  "dca2"=1-summary(survfit(dca.m2, newdata=pooled), times=120)$surv[1, ],
+  "dca3"=1-summary(survfit(dca.m3, newdata=pooled), times=120)$surv[1, ],
+  "dca4"=1-summary(survfit(dca.m4, newdata=pooled), times=120)$surv[1, ],
+  "dca5"=1-summary(survfit(dca.m5, newdata=pooled), times=120)$surv[1, ],
+  "dca6"=1-summary(survfit(dca.m6, newdata=pooled), times=120)$surv[1, ])
+
+dca(Surv(TTDM, mortstat2) ~ dca0+dca1+dca2+dca6+dca3+dca4+dca5,
+    data = pooled_dca, time = 120, thresholds = seq(0, 0.5, 0.01),
+    label = list(dca0="Baseline model", dca1="CA", dca2="AnthropoAge",
+                 dca6="CA +\nAnthropoAgeAccel",
+                 dca3="BRI", dca4="WWI", dca5="ABSI")) -> dca_fin
+
+color_palette <- c(
+  "Treat None"="black", "Treat All"="#009E73", "Baseline model" = "#0072b2",
+  "CA" = "#9683ec", "AnthropoAge" = "#35034f", "BRI" = "#f4a4ac",
+  "WWI" = "#ffb600", "ABSI" = "#d92b3a", "CA +\nAnthropoAgeAccel" = "#a10c2e")
+linetype_palette <- c(
+  "Treat None"="twodash", "Treat All"="solid", "Baseline model" = "solid",
+  "CA"="longdash", "AnthropoAge"="solid", "CA +\nAnthropoAgeAccel"="twodash",
+  "BRI" = "twodash", "WWI" = "solid", "ABSI" = "solid")
+
+dca_fin %>% as.tibble %>% filter(!is.na(net_benefit)) %>%
+  ggplot(aes(x=threshold, y=net_benefit, color=label, linetype=label)) +
+  stat_smooth(method = "loess", se = FALSE, formula = "y ~ x", span = 0.2) +
+  coord_cartesian(ylim = c(-0.014, 0.2)) +
+  scale_color_manual(values = color_palette) +
+  scale_linetype_manual(values = linetype_palette) +
+  labs(x = NULL, y = "Net Benefit", color = NULL,
+       linetype=NULL, title="Net benefit for 10-year all-cause mortality") +
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.001)) +
+  scale_x_continuous(labels=scales::percent_format(accuracy=1)) + theme_bw()+
+  theme(plot.title = element_text(hjust=0.5, face="bold"),
+        axis.text.x=element_blank(),axis.ticks.x=element_blank()) -> dca_plot
+
+dca_dat <- (dca_fin %>% as.tibble); data.frame(
+  "threshold"=rep(dca_dat$threshold[dca_dat$label=="CA"],2),
+  "nb_ca"=rep(dca_dat$net_benefit[dca_dat$label=="CA"],2),
+  "nb_aa"=c(dca_dat$net_benefit[dca_dat$label=="AnthropoAge"],
+            dca_dat$net_benefit[dca_dat$label=="CA +\nAnthropoAgeAccel"])) %>%
+  mutate("delta_nb" = as.numeric(nb_aa - nb_ca),
+         "Model" = c(rep("AnthropoAge",51),
+                     rep("CA +\nAnthropoAgeAccel",51))) %>%
+  ggplot(mapping = aes(x=threshold, y=delta_nb, color=Model)) + 
+  geom_line(aes(linetype=Model), linewidth=1) +
+  scale_color_manual(values = color_palette) +
+  scale_linetype_manual(values = linetype_palette) +
+  geom_hline(yintercept = 0,linetype="twodash", color = "black") + 
+  labs(x = "Threshold Probability",
+       y="Delta Net Benefit (vs. CA alone)") + theme_bw() +
+  scale_x_continuous(labels = scales::percent)+
+  theme(plot.title = element_text(hjust=0.5, face="bold")) -> nb_plot
+
+
 #Fig 2: overall c+tAUC- ####
-Fig2<-ggarrange(
-  Fig2a, Fig2b, Fig2c, Fig2d, labels = LETTERS[1:4],
-  nrow=2, ncol=2, common.legend = T)
+
+ggarrange(ncol=3, widths=c(1,0.045,0.65), ggarrange(
+  nrow=2,common.legend=F,legend="bottom",labels=c("A",NULL),Fig2a, ggarrange(
+    Fig2c,Fig2d, legend="bottom", common.legend=T, labels=LETTERS[2:3])), "",
+  ggarrange(dca_plot, nb_plot, ncol=1, common.legend=T,
+            legend="bottom", labels=LETTERS[4],heights=c(1,.5))) -> Fig2
 
 ggsave(
   Fig2, file="Figures/Figure2.jpg", bg="transparent",
-  width=25, height=20, units=c("cm"), dpi=600, limitsize=F)
+  width=37*0.85, height=18.5*0.85, units=c("cm"), dpi=600, limitsize=F)
 
 #SFig1: c by quintiles- ####
-Figs1 <- ggarrange(
-  ggarrange(Figs1a, Figs1d, Figs1e, labels = LETTERS[1:3],
-            ncol=3, nrow=1, common.legend = T),
-  ggarrange(Figs1b, Figs1c, labels = LETTERS[4:5],
-            ncol=2, nrow=1, legend = "none"), nrow=2)
+Figs1 <- ggarrange(Figs1a, Fig2b, Figs1e, Figs1d, Figs1b, Figs1c,
+                   labels = LETTERS[1:6], ncol=3, nrow=2, common.legend = T)
+
 ggsave(Figs1, file="Figures/FigureS1.jpg", bg="transparent",
-       width=9*2.5, height=8*2, units=c("cm"), dpi=600, limitsize = FALSE)
+       width=36, height=18.5, units=c("cm"), dpi=600, limitsize = FALSE)
+
 
 #SFig2: tAUC by survey- ####
 paste0("ROC.",c("HRS","ELSA","MHAS","CRELES","CHARLS")) %>% as.list %>%
@@ -1482,17 +2334,17 @@ ggsave(
 ## Overall MHAS
 #Uno's c-statistic
 c1.1 <- with(MHAS.A1_BX, concordance(
-  Surv(TTDM, mortstat2) ~ Age+strata(Sex)+strata(Ethnicity),
-  reverse = T, weights=wtresp, timewt = "n/G2"))
+  Surv(TTDM, mortstat2) ~ Age+strata(Sex)+strata(Ethnicity2)+
+    strata(coh), reverse = T, weights=wtresp, timewt = "n/G2"))
 c1.2 <- with(MHAS.A1_BX, concordance(
   Surv(TTDM, mortstat2) ~ AnthropoAge+strata(Sex)+strata(Ethnicity),
   reverse = T, weights=wtresp, timewt = "n/G2"))
 #t-AUC
 MHAS.A1_BX$years<-MHAS.A1_BX$TTDM/12
-m1 <- coxph(Surv(years,mortstat2)~ Age+strata(Sex)+
-              strata(Ethnicity), data=MHAS.A1_BX, y=TRUE, x=TRUE)
-m2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+strata(Sex)+
-              strata(Ethnicity), data=MHAS.A1_BX, y=TRUE, x=TRUE)
+m1 <- coxph(Surv(years,mortstat2)~ Age+strata(Sex)+coh,
+            data=MHAS.A1_BX, y=TRUE, x=TRUE)
+m2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+strata(Sex)+coh,
+            data=MHAS.A1_BX, y=TRUE, x=TRUE)
 follow <- 13; ROC.MHAS1 <- Score(
   list("Age"=m1, "AnthropoAge"=m2), formula=Hist(years,mortstat2)~1,
   data=MHAS.A1_BX, conf.int=T, cens.method = "ipcw", summary="risks",
@@ -1501,18 +2353,18 @@ data.MHAS1<-as.data.frame(ROC.MHAS1$AUC$contrasts)
 
 ## MHAS - 2001 cohort
 #Uno's c-statistic
-c2.1 <- with(MHAS.A1_B1, concordance(
-  Surv(TTDM, mortstat2) ~ Age+strata(Sex)+strata(Ethnicity),
+c2.1 <- with(MHAS.A1_B1 %>% filter(TTDM<(12*15)), concordance(
+  Surv(TTDM, mortstat2) ~ Age+strata(Sex),
   reverse = T, weights=wtresp, timewt = "n/G2"))
-c2.2 <- with(MHAS.A1_B1, concordance(
-  Surv(TTDM, mortstat2) ~ AnthropoAge+strata(Sex)+strata(Ethnicity),
+c2.2 <- with(MHAS.A1_B1 %>% filter(TTDM<(12*15)), concordance(
+  Surv(TTDM, mortstat2) ~ AnthropoAge+strata(Sex),
   reverse = T, weights=wtresp, timewt = "n/G2"))
 #tAUC
 MHAS.A1_B1$years<-MHAS.A1_B1$TTDM/12
-m1 <- coxph(Surv(years,mortstat2)~ Age+strata(Sex)+
-              strata(Ethnicity), data=MHAS.A1_B1, y=TRUE, x=TRUE)
-m2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+strata(Sex)+
-              strata(Ethnicity), data=MHAS.A1_B1, y=TRUE, x=TRUE)
+m1 <- coxph(Surv(years,mortstat2)~ Age+(Sex),
+            data=MHAS.A1_B1, y=TRUE, x=TRUE)
+m2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+(Sex),
+            data=MHAS.A1_B1, y=TRUE, x=TRUE)
 follow <- 13; ROC.MHAS2 <- Score(
   list("Age"=m1, "AnthropoAge"=m2), formula=Hist(years,mortstat2)~1,
   data=MHAS.A1_B1, conf.int=T, cens.method = "ipcw", summary="risks",
@@ -1520,21 +2372,24 @@ follow <- 13; ROC.MHAS2 <- Score(
 data.MHAS2<-as.data.frame(ROC.MHAS2$AUC$contrasts)
 
 ## MHAS - 2012 cohort
-c3.1 <- with(MHAS.A1_B2, concordance(
-  Surv(TTDM, mortstat2) ~ Age+strata(Sex)+strata(Ethnicity),
+MHAS.A1_B2_ <- MHAS.A1_B2 #%>% filter(coh=="B")
+c3.1 <- with(MHAS.A1_B2_, concordance(
+  Surv(TTDM, mortstat2) ~ Age+strata(Sex)+
+    strata(Ethnicity2)+strata(coh),
   reverse = T, weights=wtresp, timewt = "n/G2"))
-c3.2 <- with(MHAS.A1_B2, concordance(
-  Surv(TTDM, mortstat2) ~ AnthropoAge+strata(Sex)+strata(Ethnicity),
+c3.2 <- with(MHAS.A1_B2_, concordance(
+  Surv(TTDM, mortstat2) ~ AnthropoAge+strata(Sex)+
+    strata(Ethnicity2)+strata(coh),
   reverse = T, weights=wtresp, timewt = "n/G2"))
 #tAUC
-MHAS.A1_B2$years<-MHAS.A1_B2$TTDM/12
+MHAS.A1_B2_$years<-MHAS.A1_B2_$TTDM/12
 m1 <- coxph(Surv(years,mortstat2)~ Age+strata(Sex)+
-              strata(Ethnicity), data=MHAS.A1_B2, y=TRUE, x=TRUE)
+              strata(coh), data=MHAS.A1_B2_, y=TRUE, x=TRUE)
 m2 <- coxph(Surv(years,mortstat2)~ AnthropoAge+strata(Sex)+
-              strata(Ethnicity), data=MHAS.A1_B2, y=TRUE, x=TRUE)
+              strata(coh), data=MHAS.A1_B2_, y=TRUE, x=TRUE)
 follow <- 9; ROC.MHAS3 <- Score(
   list("Age"=m1, "AnthropoAge"=m2), formula=Hist(years,mortstat2)~1,
-  data=MHAS.A1_B2, conf.int=T, cens.method = "ipcw", summary="risks",
+  data=MHAS.A1_B2_, conf.int=T, cens.method = "ipcw", summary="risks",
   metrics="auc", plots="roc", times = c(seq(1, follow, 1)))
 data.MHAS3<-as.data.frame(ROC.MHAS3$AUC$contrasts)
 
@@ -1563,14 +2418,16 @@ paste0("c",c(1,1,2,2,3,3),".",rep(1:2,3)) %>%
 (c(ROC.MHAS2$AUC$score$upper, ROC.MHAS3$AUC$score$upper) %>%
     max+0.01) %>% round(2) -> max1
 FigS3b <- autoplot(ROC.MHAS2, conf.int=T, lwd = 1.2) + ylim(min1,max1) +
-  scale_color_manual(values=colors) + scale_fill_manual(values=colors) +
+  scale_color_manual(values = c("#9683ec","#35034f")) +
+  scale_fill_manual(values = c("#9683ec","#35034f")) +
   scale_x_continuous(breaks=seq(0,14,2)) +
   labs(fill="Marker", col="Marker", y="tAUC (95%CI)\n",
        x="Years of follow-up", title="MHAS 2001") + theme_pubclean() + 
   theme(plot.title=element_text(hjust=0.5, face="bold", size=14),
         legend.position = "top"); FigS3b
 FigS3c <- autoplot(ROC.MHAS3, conf.int=T, lwd = 1.2) + ylim(min1,max1) +
-  scale_color_manual(values=colors) + scale_fill_manual(values=colors) +
+  scale_color_manual(values = c("#9683ec","#35034f")) +
+  scale_fill_manual(values = c("#9683ec","#35034f")) +
   scale_x_continuous(breaks=seq(0,14,2)) +
   labs(fill="Marker", col="Marker", y="tAUC (95%CI)\n",
        x="Years of follow-up", title="MHAS 2012") + theme_pubclean() + 
@@ -1605,7 +2462,7 @@ ggsave(
   FigS3, file="Figures/FigureS3.jpg", bg="transparent",
   width=36, height=18.5, units=c("cm"), dpi=600, limitsize = FALSE)
 
-#STab2: Harrel's c----- ####
+#STab7: Harrel's c----- ####
 ##Harrell's c-statistic  comparison
 compareC_alt <- function(x,y){
   #Load packages
@@ -1615,10 +2472,10 @@ compareC_alt <- function(x,y){
   #C statistics
   index1 <- with(x, survcomp::concordance.index(
     x=AnthropoAge, surv.time=TTDM, surv.event=mortstat2, outx = F,
-    weights=std_weights, strat=paste(Sex, Ethnicity), method="noether"))
+    weights=std_weights, strat=paste(Sex, Ethnicity2), method="noether"))
   index2 <- with(x, survcomp::concordance.index(
     x=Age, surv.time=TTDM, surv.event=mortstat2, outx = F,
-    weights=std_weights, strat=paste(Sex, Ethnicity), method="noether"))
+    weights=std_weights, strat=paste(Sex, Ethnicity2), method="noether"))
   #Compare
   comp <- survcomp::cindex.comp(index1, index2)
   #Data.frame
@@ -1668,6 +2525,211 @@ set_flextable_defaults(
   body_add_flextable(value=tab2) %>% print(target = "Tables/TableS2.docx")
 
 
+
+#STab8: Pandemic eff.-- ####
+
+#Subjects affected
+((pooled$D.DATE %>% stringr::str_sub(1,4) %>%
+    as.numeric)>2019) %>% sum(na.rm=T)
+((pooled$D.DATE %>% stringr::str_sub(1,4) %>%
+    as.numeric)>2019) %>% table(pooled$G2ASTUDY)
+
+## ALL participants ##
+#Unadjusted
+sens1A <- coxph(Surv(TTDM,mortstat2)~ AnthropoAge+strata(Sex)+
+                  strata(Ethnicity), data=pooled0)
+sens1B <- coxph(Surv(TTDM,mortstat2)~ AnthropoAge+strata(Sex)+
+                  strata(Ethnicity), data=pooled1)
+sens1C <- coxph(Surv(TTDM,mortstat2)~ AnthropoAge+strata(Sex)+
+                  strata(Ethnicity), data=pooled3)
+sens1D <- coxph(Surv(TTDM,mortstat2)~ AnthropoAge+strata(Sex)+
+                  strata(Ethnicity), data=pooled5)
+#Adjusted
+sens2A <-coxph(Surv(TTDM,mortstat2)~AnthropoAge+strata(Sex)+strata(Ethnicity)+
+                 Education+Smoking+Drinking+n_comorb, data=pooled0)
+sens2B <-coxph(Surv(TTDM,mortstat2)~AnthropoAge+strata(Sex)+strata(Ethnicity)+
+                 Education+Smoking+Drinking+n_comorb, data=pooled1)
+sens2C <-coxph(Surv(TTDM,mortstat2)~AnthropoAge+strata(Sex)+strata(Ethnicity)+
+                 Education+Smoking+Drinking+n_comorb, data=pooled3)
+sens2D <-coxph(Surv(TTDM,mortstat2)~AnthropoAge+strata(Sex)+strata(Ethnicity)+
+                 Education+Smoking+Drinking+n_comorb, data=pooled5)
+
+## Participants WITHOUT 2020-2021 ##
+pooled0. <- pooled0 %>% mutate(
+  "year_death" = ((D.DATE %>% stringr::str_sub(1,4) %>% as.numeric))) %>%
+  filter(is.na(year_death)|year_death<=2019)
+pooled1. <- pooled0. %>% filter(G2ASTUDY=="HRS")
+pooled3. <- pooled0. %>% filter(G2ASTUDY=="MHAS")
+pooled5. <- pooled0. %>% filter(G2ASTUDY=="CHARLS")
+
+#Unadjusted
+sens3A <- coxph(Surv(TTDM,mortstat2)~ AnthropoAge+strata(Sex)+
+                  strata(Ethnicity), data=pooled0.)
+sens3B <- coxph(Surv(TTDM,mortstat2)~ AnthropoAge+strata(Sex)+
+                  strata(Ethnicity), data=pooled1.)
+sens3C <- coxph(Surv(TTDM,mortstat2)~ AnthropoAge+strata(Sex)+
+                  strata(Ethnicity), data=pooled3.)
+sens3D <- coxph(Surv(TTDM,mortstat2)~ AnthropoAge+strata(Sex)+
+                  strata(Ethnicity), data=pooled5.)
+#Adjusted
+sens4A <-coxph(Surv(TTDM,mortstat2)~AnthropoAge+strata(Sex)+strata(Ethnicity)+
+                 Education+Smoking+Drinking+n_comorb, data=pooled0.)
+sens4B <-coxph(Surv(TTDM,mortstat2)~AnthropoAge+strata(Sex)+strata(Ethnicity)+
+                 Education+Smoking+Drinking+n_comorb, data=pooled1.)
+sens4C <-coxph(Surv(TTDM,mortstat2)~AnthropoAge+strata(Sex)+strata(Ethnicity)+
+                 Education+Smoking+Drinking+n_comorb, data=pooled3.)
+sens4D <-coxph(Surv(TTDM,mortstat2)~AnthropoAge+strata(Sex)+strata(Ethnicity)+
+                 Education+Smoking+Drinking+n_comorb, data=pooled5.)
+
+cstat_sens <- function(x){
+  c<-concordance(x)$concordance; z<-concordance(x)$var
+  ci <- c + c(1,-1)*qnorm(0.975)*sqrt(z)
+  d <- c(c, ci) %>% sprintf(fmt="%#.3f")
+  paste0(d[1], " (", d[2], "-", d[3], ")")}
+hr_sens <- function(x){
+  d <- summary(x)$conf.int[1,c(1,3:4)]%>% sprintf(fmt="%#.3f")
+  paste0(d[1], " (", d[2], "-", d[3], ")")}
+
+cbind(c(list(sens1A,sens1B,sens1C,sens1D) %>% sapply(cstat_sens),"",
+        list(sens2A,sens2B,sens2C,sens2D) %>% sapply(cstat_sens)),
+      c(list(sens1A,sens1B,sens1C,sens1D) %>% sapply(hr_sens),"",
+        list(sens2A,sens2B,sens2C,sens2D) %>% sapply(hr_sens)),
+      
+      c(list(sens3A,sens3B,sens3C,sens3D) %>% sapply(cstat_sens),"",
+        list(sens4A,sens4B,sens4C,sens4D) %>% sapply(cstat_sens)),
+      c(list(sens3A,sens3B,sens3C,sens1D) %>% sapply(hr_sens),"",
+        list(sens4A,sens4B,sens4C,sens2D) %>% sapply(hr_sens))) %>% View
+
+
+
+
+#SFig4: Splines-------- ####
+
+pooled$sc_p1 <- scale(pooled$AnthropoAge)
+pooled$sc_p2 <- scale(pooled$AnthropoAgeAccel)
+pooled$sc_p3 <- scale(pooled$BMI)
+pooled$sc_p4 <- scale(pooled$ICE)
+
+#AnthropoAge
+coxph(
+  Surv(TTDM,mortstat2)~poly(sc_p1,1)+poly(Age,3)+strata(Sex)+strata(Ethnicity)+
+    Education+Smoking+Drinking+n_comorb, data=pooled) -> sp1.A
+coxph(
+  Surv(TTDM,mortstat2)~poly(sc_p1,2)+poly(Age,3)+strata(Sex)+strata(Ethnicity)+
+    Education+Smoking+Drinking+n_comorb, data=pooled) -> sp1.B
+coxph(
+  Surv(TTDM,mortstat2)~poly(sc_p1,3)+poly(Age,3)+strata(Sex)+strata(Ethnicity)+
+    Education+Smoking+Drinking+n_comorb, data=pooled) -> sp1.C
+mods <- paste0("sp1.",LETTERS[1:3]); mod_sel <- mods[as.list(
+  mods) %>% lapply(get) %>% sapply(BIC)%>%which.min]
+pooled$r1<-1-predict(get(mod_sel),newdata=pooled,type="survival",ci=F,times=120)
+
+#AnthropoAgeAccel
+coxph(
+  Surv(TTDM,mortstat2)~poly(sc_p2,1)+poly(Age,3)+strata(Sex)+strata(Ethnicity)+
+    Education+Smoking+Drinking+n_comorb, data=pooled) -> sp1.A
+coxph(
+  Surv(TTDM,mortstat2)~poly(sc_p2,2)+poly(Age,3)+strata(Sex)+strata(Ethnicity)+
+    Education+Smoking+Drinking+n_comorb, data=pooled) -> sp1.B
+coxph(
+  Surv(TTDM,mortstat2)~poly(sc_p2,3)+poly(Age,3)+strata(Sex)+strata(Ethnicity)+
+    Education+Smoking+Drinking+n_comorb, data=pooled) -> sp1.C
+mods <- paste0("sp1.",LETTERS[1:3]); mod_sel <- mods[as.list(
+  mods) %>% lapply(get) %>% sapply(BIC)%>%which.min]
+pooled$r2<-1-predict(get(mod_sel),newdata=pooled,type="survival",ci=F,times=120)
+
+#BMI
+coxph(
+  Surv(TTDM,mortstat2)~poly(sc_p3,1)+poly(Age,3)+strata(Sex)+strata(Ethnicity)+
+    Education+Smoking+Drinking+n_comorb, data=pooled) -> sp1.A
+coxph(
+  Surv(TTDM,mortstat2)~poly(sc_p3,2)+poly(Age,3)+strata(Sex)+strata(Ethnicity)+
+    Education+Smoking+Drinking+n_comorb, data=pooled) -> sp1.B
+coxph(
+  Surv(TTDM,mortstat2)~poly(sc_p3,3)+poly(Age,3)+strata(Sex)+strata(Ethnicity)+
+    Education+Smoking+Drinking+n_comorb, data=pooled) -> sp1.C
+mods <- paste0("sp1.",LETTERS[1:3]); mod_sel <- mods[as.list(
+  mods) %>% lapply(get) %>% sapply(BIC)%>%which.min]
+pooled$r3<-1-predict(get(mod_sel),newdata=pooled,type="survival",ci=F,times=120)
+
+#WHtR
+coxph(
+  Surv(TTDM,mortstat2)~poly(sc_p4,1)+poly(Age,3)+strata(Sex)+strata(Ethnicity)+
+    Education+Smoking+Drinking+n_comorb, data=pooled) -> sp1.A
+coxph(
+  Surv(TTDM,mortstat2)~poly(sc_p4,2)+poly(Age,3)+strata(Sex)+strata(Ethnicity)+
+    Education+Smoking+Drinking+n_comorb, data=pooled) -> sp1.B
+coxph(
+  Surv(TTDM,mortstat2)~poly(sc_p4,3)+poly(Age,3)+strata(Sex)+strata(Ethnicity)+
+    Education+Smoking+Drinking+n_comorb, data=pooled) -> sp1.C
+mods <- paste0("sp1.",LETTERS[1:3]); mod_sel <- mods[as.list(
+  mods) %>% lapply(get) %>% sapply(BIC)%>%which.min]
+pooled$r4<-1-predict(get(mod_sel),newdata=pooled,type="survival",ci=F,times=120)
+
+data.frame(
+  "Sex"=rep(pooled$Sex, 4),
+  "Lab"=c(rep("AnthropoAge",nrow(pooled)),
+          rep("AnthropoAgeAccel",nrow(pooled)),
+          rep("BMI",nrow(pooled)), rep("WHtR",nrow(pooled))),
+  "Pred"=c(pooled$AnthropoAge,pooled$AnthropoAgeAccel,
+           pooled$BMI,pooled$ICE),
+  "Risk"=c(pooled$r1,pooled$r2,pooled$r3,pooled$r4)) %>%
+  filter(Pred>=quantile(Pred,0.05), Pred<=quantile(Pred,0.95)) %>% 
+  ggplot(aes(x=Pred, y=Risk, color=Sex))+
+  geom_smooth(alpha=0.3,fullrange=F)+facet_wrap(~Lab, scales = "free_x")+
+  scale_color_manual(values=c("#6699CC","#994455"))+theme_bw()+
+  scale_x_continuous(name="Predictor (per 1-SD increase)", limits = NULL)+
+  scale_y_continuous(name="10-year mortality risk", limits=NULL)+
+  theme(legend.position = "bottom")
+
+cov<-c("Age", "Sex", "Ethnicity", "Education", "Smoking","Drinking","n_comorb")
+var<-c("AnthropoAge","AnthropoAgeAccel","BMI","ICE","WWI","ABSI")
+
+(plotRCS::rcsplot(data=pooled, outcome="mortstat2", time="TTDM",
+                 ref.value="median", exposure=var[1], covariates=cov)) +
+  geom_vline(xintercept=median(pooled$AnthropoAge),linewidth=0.25,linetype=2)+
+  theme_pubclean()+geom_rug(aes(x=AnthropoAge), size=0.25)+
+  labs(x="AnthropoAge (years)")+
+  theme(text=element_text(family="sans")) -> rcsp1
+(plotRCS::rcsplot(data=pooled, outcome="mortstat2", time="TTDM",
+                  ref.value="median", exposure=var[2], covariates=cov)) +
+  geom_vline(xintercept=median(pooled$AnthropoAgeAccel),linewidth=0.25,linetype=2)+
+  theme_pubclean()+geom_rug(aes(x=AnthropoAgeAccel), size=0.25)+
+  labs(x="AnthropoAgeAccel (years)")+
+  theme(text=element_text(family="sans")) -> rcsp2
+(plotRCS::rcsplot(data=pooled, outcome="mortstat2", time="TTDM",
+                  ref.value="median", exposure=var[3], covariates=cov)) +
+  geom_vline(xintercept=median(pooled$BMI),linewidth=0.25,linetype=2)+
+  theme_pubclean()+geom_rug(aes(x=BMI), size=0.25)+
+  labs(x="Body mass index (kg/m^2)")+
+  theme(text=element_text(family="sans")) -> rcsp3
+(plotRCS::rcsplot(data=pooled, outcome="mortstat2", time="TTDM",
+                  ref.value="median", exposure=var[4], covariates=cov)) +
+  geom_vline(xintercept=median(pooled$ICE),linewidth=0.25,linetype=2)+
+  theme_pubclean()+geom_rug(aes(x=ICE), size=0.25)+
+  labs(x="Waist-to-Height ratio")+
+  theme(text=element_text(family="sans")) -> rcsp4
+(plotRCS::rcsplot(data=pooled, outcome="mortstat2", time="TTDM",
+                  ref.value="median", exposure=var[5], covariates=cov)) +
+  geom_vline(xintercept=median(pooled$WWI),linewidth=0.25,linetype=2)+
+  theme_pubclean()+geom_rug(aes(x=WWI), size=0.25)+
+  labs(x="Weight-adjusted-waist index")+
+  theme(text=element_text(family="sans")) -> rcsp5
+(plotRCS::rcsplot(data=pooled, outcome="mortstat2", time="TTDM",
+                  ref.value="median", exposure=var[6], covariates=cov)) +
+  geom_vline(xintercept=median(pooled$ABSI),linewidth=0.25,linetype=2)+
+  theme_pubclean()+geom_rug(aes(x=ABSI), size=0.25)+
+  labs(x="A body shape index")+
+  theme(text=element_text(family="sans")) -> rcsp6
+
+ggarrange(rcsp1,rcsp2,rcsp3,rcsp4,rcsp5,rcsp6,
+          labels=LETTERS[1:6], ncol=3, nrow=2) -> supp_rcs
+
+ggsave(
+  supp_rcs, file="Figures/FigureS_RCS.jpg", bg="transparent",
+  width=36, height=18.5, units=c("cm"), dpi=600, limitsize = FALSE)
+
+
 ####-------------------------------- CHANGES OVER TIME ------------#### ----####
 #Correlation structure- ####
 #HRS 8, 10, 12, 14
@@ -1683,6 +2745,7 @@ G2A_mega2 %>% select(ID, AnthropoAge, year) %>% arrange(year) %>%
   pivot_wider(names_from=year, values_from=AnthropoAge, values_fill=NA) %>%
   select(-1) %>% cor(use="pairwise.complete.obs")
 #MHAS
+#MHAS is the only cohort where an exchangeable corrstr seems more appropriate
 G2A_mega3 %>% select(ID, AnthropoAge, year) %>% arrange(year) %>%
   pivot_wider(names_from=year, values_from=AnthropoAge, values_fill=NA) %>%
   select(-1) %>% cor(use="pairwise.complete.obs")
@@ -1698,19 +2761,19 @@ G2A_mega5 %>% select(ID, AnthropoAge, year) %>% arrange(year) %>%
 
 #Gaussian GEE's ------- ####
 mBS1 <- geeglm(
-  AnthropoAge~YearsDiff2, id=ID, data=filter(G2A_mega, Country=="USA"),
+  AnthropoAge~YearsDiff2+coh, id=ID, data=filter(G2A_mega, Country=="USA"),
   weights = std_weights, wave = wave2, corstr = "ar1", family = gaussian())
 mBS2 <- geeglm(
-  AnthropoAge~YearsDiff2, id=ID, data=filter(G2A_mega, Country=="England"),
+  AnthropoAge~YearsDiff2+coh, id=ID, data=filter(G2A_mega, Country=="England"),
   weights = std_weights, wave = wave2, corstr = "ar1", family = gaussian())
 mBS3 <- geeglm(
-  AnthropoAge~YearsDiff2, id=ID, data=filter(G2A_mega, Country=="Mexico"),
-  weights = std_weights, wave = wave2, corstr = "ar1", family = gaussian())
+  AnthropoAge~YearsDiff2+coh, id=ID, data=filter(G2A_mega, Country=="Mexico"),
+  weights=std_weights, wave=wave2, corstr="exchangeable", family=gaussian())
 mBS4 <- geeglm(
   AnthropoAge~YearsDiff2, id=ID, data=filter(G2A_mega, Country=="Costa Rica"),
   weights = std_weights, wave = wave2, corstr = "ar1", family = gaussian())
 mBS5 <- geeglm(
-  AnthropoAge~YearsDiff2, id=ID, data=filter(G2A_mega, Country=="China"),
+  AnthropoAge~YearsDiff2+coh, id=ID, data=filter(G2A_mega, Country=="China"),
   weights = std_weights, wave = wave2, corstr = "ar1", family = gaussian())
 
 b1 <- summary(mBS1)$coefficients[2,1]; ci1 <- confint(mBS1) %>% round(3)
@@ -1725,6 +2788,7 @@ ann_f1 <- c(
   paste0("β = ", b3 %>% round(3), "\n(", ci3[2,1], "—", ci3[2,2], ")"),
   paste0("β = ", b4 %>% round(3), "\n(", ci4[2,1], "—", ci4[2,2], ")"),
   paste0("β = ", b5 %>% round(3), "\n(", ci5[2,1], "—", ci5[2,2], ")"))
+
 
 #Fig 3: Aging trends--- ####
 #CA vs BA: Longitudinal trends by year and country
@@ -1823,26 +2887,175 @@ G2A_mega %>% mutate(
         strip.background=element_blank(), plot.background=element_blank(),
         panel.background=element_blank(), legend.background=element_blank())
 
+#STab9: Adj. trends---- ####
+G2A_mega. <- G2A_mega %>%
+  filter(!is.na(Sex),!is.na(Ethnicity),!is.na(coh),!is.na(Education),
+         !is.na(Smoking),!is.na(Drinking),!is.na(n_comorb))
+
+#Adjustment 1: Sex, ethnicity, cohort
+mBS1.1 <- geeglm(
+  AnthropoAge~YearsDiff2 + Sex + Ethnicity + coh, id=ID,
+  data=filter(G2A_mega., Country=="USA"), weights = std_weights,
+  wave = wave2, corstr = "ar1", family = gaussian())
+mBS2.1 <- geeglm(
+  AnthropoAge~YearsDiff2 + Sex + coh, id=ID,
+  data=filter(G2A_mega., Country=="England"), weights = std_weights,
+  wave = wave2, corstr = "ar1", family = gaussian())
+mBS3.1 <- geeglm(
+  AnthropoAge~YearsDiff2 + Sex + coh, id=ID,
+  data=filter(G2A_mega., Country=="Mexico"), weights=std_weights,
+  wave=wave2, corstr="exchangeable", family=gaussian())
+mBS4.1 <- geeglm(
+  AnthropoAge~YearsDiff2 + Sex, id=ID,
+  data=filter(G2A_mega., Country=="Costa Rica"),
+  weights = std_weights, wave = wave2, corstr = "ar1", family = gaussian())
+mBS5.1 <- geeglm(
+  AnthropoAge~YearsDiff2 + Sex + coh, id=ID,
+  data=filter(G2A_mega., Country=="China"),
+  weights = std_weights, wave = wave2, corstr = "ar1", family = gaussian())
+
+b1.1 <- summary(mBS1.1)$coefficients[2,1]; ci1.1 <- confint(mBS1.1)
+b2.1 <- summary(mBS2.1)$coefficients[2,1]; ci2.1 <- confint(mBS2.1)
+b3.1 <- summary(mBS3.1)$coefficients[2,1]; ci3.1 <- confint(mBS3.1)
+b4.1 <- summary(mBS4.1)$coefficients[2,1]; ci4.1 <- confint(mBS4.1)
+b5.1 <- summary(mBS5.1)$coefficients[2,1]; ci5.1 <- confint(mBS5.1)
+
+ann_f1.1 <- (rbind(
+  c(b1.1, ci1.1[2,1:2]), c(b2.1, ci2.1[2,1:2]), c(b3.1, ci3.1[2,1:2]),
+  c(b4.1, ci4.1[2,1:2]), c(b5.1, ci5.1[2,1:2])) %>% as.data.frame() %>%
+    `colnames<-`(LETTERS[1:3]) %>% transmute("M"=paste0(
+      sprintf(A, fmt="%#.3f"), "\n(", sprintf(B, fmt="%#.3f"), "-",
+      sprintf(C, fmt="%#.3f"), ")")))$M
+
+#Adjustment 2: Sex, ethnicity, cohort, education, lifestyle
+mBS1.2 <- geeglm(
+  AnthropoAge~YearsDiff2 + Sex + Ethnicity + coh +
+    Education + Smoking + Drinking, id=ID,
+  data=filter(G2A_mega., Country=="USA"), weights = std_weights,
+  wave = wave2, corstr = "ar1", family = gaussian())
+mBS2.2 <- geeglm(
+  AnthropoAge~YearsDiff2 + Sex + coh +
+    Education + Smoking + Drinking, id=ID,
+  data=filter(G2A_mega., Country=="England"), weights = std_weights,
+  wave = wave2, corstr = "ar1", family = gaussian())
+mBS3.2 <- geeglm(
+  AnthropoAge~YearsDiff2 + Sex + coh +
+    Education + Smoking + Drinking, id=ID,
+  data=filter(G2A_mega., Country=="Mexico"), weights=std_weights,
+  wave=wave2, corstr="exchangeable", family=gaussian())
+mBS4.2 <- geeglm(
+  AnthropoAge~YearsDiff2 + Sex +
+    Education + Smoking + Drinking, id=ID,
+  data=filter(G2A_mega., Country=="Costa Rica"),
+  weights = std_weights, wave = wave2, corstr = "ar1", family = gaussian())
+mBS5.2 <- geeglm(
+  AnthropoAge~YearsDiff2 + Sex + coh +
+    Education + Smoking + Drinking, id=ID,
+  data=filter(G2A_mega., Country=="China"),
+  weights = std_weights, wave = wave2, corstr = "ar1", family = gaussian())
+
+b1.2 <- summary(mBS1.2)$coefficients[2,1]; ci1.2 <- confint(mBS1.2)
+b2.2 <- summary(mBS2.2)$coefficients[2,1]; ci2.2 <- confint(mBS2.2)
+b3.2 <- summary(mBS3.2)$coefficients[2,1]; ci3.2 <- confint(mBS3.2)
+b4.2 <- summary(mBS4.2)$coefficients[2,1]; ci4.2 <- confint(mBS4.2)
+b5.2 <- summary(mBS5.2)$coefficients[2,1]; ci5.2 <- confint(mBS5.2)
+
+ann_f1.2 <- (rbind(
+  c(b1.2, ci1.2[2,1:2]), c(b2.2, ci2.2[2,1:2]), c(b3.2, ci3.2[2,1:2]),
+  c(b4.2, ci4.2[2,1:2]), c(b5.2, ci5.2[2,1:2])) %>% as.data.frame() %>%
+  `colnames<-`(LETTERS[1:3]) %>% transmute("M"=paste0(
+    sprintf(A, fmt="%#.3f"), "\n(", sprintf(B, fmt="%#.3f"), "-",
+    sprintf(C, fmt="%#.3f"), ")")))$M
+
+
+#Adjustment 3: Sex, ethnicity, cohort, education, lifestyle, comorbidities
+mBS1.3 <- geeglm(
+  AnthropoAge~YearsDiff2 + Sex + Ethnicity + coh +
+    Education + Smoking + Drinking + n_comorb, id=ID,
+  data=filter(G2A_mega., Country=="USA"), weights = std_weights,
+  wave = wave2, corstr = "ar1", family = gaussian())
+mBS2.3 <- geeglm(
+  AnthropoAge~YearsDiff2 + Sex + coh +
+    Education + Smoking + Drinking + n_comorb, id=ID,
+  data=filter(G2A_mega., Country=="England"), weights = std_weights,
+  wave = wave2, corstr = "ar1", family = gaussian())
+mBS3.3 <- geeglm(
+  AnthropoAge~YearsDiff2 + Sex + coh +
+    Education + Smoking + Drinking + n_comorb, id=ID,
+  data=filter(G2A_mega., Country=="Mexico"), weights=std_weights,
+  wave=wave2, corstr="exchangeable", family=gaussian())
+mBS4.3 <- geeglm(
+  AnthropoAge~YearsDiff2 + Sex +
+    Education + Smoking + Drinking + n_comorb, id=ID,
+  data=filter(G2A_mega., Country=="Costa Rica"),
+  weights = std_weights, wave = wave2, corstr = "ar1", family = gaussian())
+mBS5.3 <- geeglm(
+  AnthropoAge~YearsDiff2 + Sex + coh +
+    Education + Smoking + Drinking + n_comorb, id=ID,
+  data=filter(G2A_mega., Country=="China"),
+  weights = std_weights, wave = wave2, corstr = "ar1", family = gaussian())
+
+b1.3 <- summary(mBS1.3)$coefficients[2,1]; ci1.3 <- confint(mBS1.3)
+b2.3 <- summary(mBS2.3)$coefficients[2,1]; ci2.3 <- confint(mBS2.3)
+b3.3 <- summary(mBS3.3)$coefficients[2,1]; ci3.3 <- confint(mBS3.3)
+b4.3 <- summary(mBS4.3)$coefficients[2,1]; ci4.3 <- confint(mBS4.3)
+b5.3 <- summary(mBS5.3)$coefficients[2,1]; ci5.3 <- confint(mBS5.3)
+
+ann_f1.3 <- (rbind(
+  c(b1.3, ci1.3[2,1:2]), c(b2.3, ci2.3[2,1:2]), c(b3.3, ci3.3[2,1:2]),
+  c(b4.3, ci4.3[2,1:2]), c(b5.3, ci5.3[2,1:2])) %>% as.data.frame() %>%
+  `colnames<-`(LETTERS[1:3]) %>% transmute("M"=paste0(
+    sprintf(A, fmt="%#.3f"), "\n(", sprintf(B, fmt="%#.3f"), "-",
+    sprintf(C, fmt="%#.3f"), ")")))$M
+
+cbind(
+  c("None", "+ Sex, ethnicity", "+ Education, smoking,\nalcohol intake",
+    "+ Number of comorbidities"), rbind(
+      str_replace(str_remove(ann_f1,"β = "),"—","-"),
+      ann_f1.1, ann_f1.2, ann_f1.3)) %>% as.data.frame %>% `colnames<-`(c(
+        "Adjustments",paste0("AnthropoAge increase per year (β with 95% CI).",
+                             c("HRS", "ELSA", "MHAS", "CRELES", "CHARLS")))) %>%
+  flextable() %>% bold(part="header") %>% italic(j=1, part="body") %>%
+  separate_header(opts = c("span-top", "bottom-vspan", "center-hspan")) %>% 
+  align(align="center", part="all") -> tab.s9
+
+set_flextable_defaults(
+  split=F, table_align="center", table.layout="autofit"); read_docx() %>%
+  body_add_flextable(value=tab.s9) %>% print(target="Tables/TableS9.docx")
+
+
+
+
 #SFig4: Trends by sex-- ####
-gee_gauss_sex <- function(x){
+gee_gauss_sex <- function(x,y){
+  geeglm1 = geeglm(
+    AnthropoAge~YearsDiff2+coh, id = ID, data = x %>% filter(Sex=="Women"),
+    weights = std_weights, wave = wave2, corstr = y,
+    std.err = "san.se", family = gaussian())
+  geeglm2 = geeglm(
+    AnthropoAge~YearsDiff2+coh, id = ID, data = x %>% filter(Sex=="Men"),
+    weights = std_weights, wave = wave2, corstr = y,
+    std.err = "san.se", family = gaussian())
+  return(list(geeglm1, geeglm2))}
+gee_gauss_sex2 <- function(x,y){
   geeglm1 = geeglm(
     AnthropoAge~YearsDiff2, id = ID, data = x %>% filter(Sex=="Women"),
-    weights = std_weights, wave = wave2, corstr = "ar1",
+    weights = std_weights, wave = wave2, corstr = y,
     std.err = "san.se", family = gaussian())
   geeglm2 = geeglm(
     AnthropoAge~YearsDiff2, id = ID, data = x %>% filter(Sex=="Men"),
-    weights = std_weights, wave = wave2, corstr = "ar1",
+    weights = std_weights, wave = wave2, corstr = y,
     std.err = "san.se", family = gaussian())
   return(list(geeglm1, geeglm2))}
-mBS1_ <- gee_gauss_sex(G2A_mega %>% filter(
+mBS1_ <- gee_gauss_sex2(y="ar1", x=G2A_mega %>% filter(
   G2ASTUDY=="HRS")); mBS1_w <- mBS1_[[1]]; mBS1_m <- mBS1_[[2]]
-mBS2_ <- gee_gauss_sex(G2A_mega %>% filter(
+mBS2_ <- gee_gauss_sex2(y="ar1", x=G2A_mega %>% filter(
   G2ASTUDY=="ELSA")); mBS2_w <- mBS2_[[1]]; mBS2_m <- mBS2_[[2]]
-mBS3_ <- gee_gauss_sex(G2A_mega %>% filter(
+mBS3_ <- gee_gauss_sex2(y="exchangeable", x=G2A_mega %>% filter(
   G2ASTUDY=="MHAS")); mBS3_w <- mBS3_[[1]]; mBS3_m <- mBS3_[[2]]
-mBS4_ <- gee_gauss_sex(G2A_mega %>% filter(
+mBS4_ <- gee_gauss_sex2(y="ar1", x=G2A_mega %>% filter(
   G2ASTUDY=="CRELES")); mBS4_w <- mBS4_[[1]]; mBS4_m <- mBS4_[[2]]
-mBS5_ <- gee_gauss_sex(G2A_mega %>% filter(
+mBS5_ <- gee_gauss_sex2(y="ar1", x=G2A_mega %>% filter(
   G2ASTUDY=="CHARLS")); mBS5_w <- mBS5_[[1]]; mBS5_m <- mBS5_[[2]]
 
 #Women labels
@@ -1983,29 +3196,31 @@ ggsave(FigS6, file="Figures/FigureS6.jpg", bg="transparent",
 ####-------------------------------- ACCELERATED AGING ------------#### ----####
 #Kaplan Meier plot---------- ####
 pooled0 <- pooled
-km_by_study <- function(x,y=0.8,z=144,a="top"){
+
+km_by_study <- function(x,y=0.7,z=10,a="top",b=2){
   i <- as.numeric(deparse(substitute(x)) %>% substr(7,7))+1
-  studies <- c("Overall sample", "HRS", "ELSA", "MHAS", "CRELES", "CHARLS")
-  km_mod <- survfit(Surv(TTDM, mortstat2) ~ (n_comorb>=2)+accel, data=x)
+  studies <- c("Accelerated aging and multimorbidity",
+               "HRS", "ELSA", "MHAS", "CRELES", "CHARLS")
+  km_mod <- survfit(Surv(TTDY, mortstat2) ~ (n_comorb>=2)+accel, data=x)
   kmf_st_<-ggsurvplot(
     km_mod, data=pooled, size=1, conf.int=T, risk.table=T,
-    xlab="Follow-up (months)", ylab="Mortality (%)",
+    xlab="Follow-up time (years)", ylab="Mortality (%)",
     legend.labs = c("Non-Accel+\nNo-Multimorb", "Accel+\nNo-Multimorb",
                     "Non-Accel+\nMultimorb","Accel+\nMultimorb"),
     surv.scale="percent", fun="cumhaz", pval = T,
     palette = c("#B8B8F7","#957ADF","#683798","#35034F"),
     risk.table.y.text.col=TRUE,  risk.table.y.text=FALSE, risk.table.title="",
-    break.y.by= c(0.1), ylim=c(0,y),xlim=c(0,z),break.x.by= c(z/6),
+    break.y.by= c(0.1), ylim=c(0,y),xlim=c(0,z), break.x.by=b,
     ggtheme = theme_light() +(theme(
-      plot.title = element_text(hjust = 0.5, face = "bold", size=15),
+      plot.title = element_text(hjust = 0.5, face = "bold", size=14),
       text = element_text(hjust=0.5, family = "sans", size=15),
       legend.text = element_text(hjust=0.5, size=12),
       plot.subtitle = element_text(hjust=0.5, size=12)))
   ); kmf_st_$table <- kmf_st_$table + xlab("") +
     theme(panel.grid = element_blank(), title = element_blank()) +
     scale_x_continuous(labels = NULL, breaks = NULL, sec.axis = dup_axis(
-      name = element_blank(), breaks = c(seq(0,z, by=z/6)),
-      labels = c(seq(0,z, by=z/6)))
+      name = element_blank(), breaks = c(seq(0,z, by=b)),
+      labels = c(seq(0,z, by=b)))
     ); kmf_st_$plot <- kmf_st_$plot + ggtitle(studies[i]) + theme(
       panel.grid.major.x = element_line(size = 0.2,linetype = 1),
       panel.grid.major.y = element_line(size = 0.2,linetype = 1),
@@ -2014,16 +3229,14 @@ km_by_study <- function(x,y=0.8,z=144,a="top"){
     plot_layout(heights = c(5, 1.5))
   if (i==1){return (list(kmf_st, kmf_st_$plot))}
   else if (i!=1){return(kmf_st)}}
-
-km_by_study(pooled0, 0.8, 144) -> fig4a #Overall
-
+km_by_study(pooled0, 0.7, 10, "top") -> fig4a #Overall
 
 #SFig7: KM plot by study---- ####
-km_by_study(pooled3, 0.8, 144, "none") -> fs7a #MHAS
-km_by_study(pooled1, 0.8, 144, "none") -> fs7b #HRS
-km_by_study(pooled5, 0.5, 96, "none") -> fs7c #CHARLS
-km_by_study(pooled2, 0.5, 96, "none") -> fs7d #ELSA
-km_by_study(pooled4, 0.5, 48, "none") -> fs7e #CRELES
+km_by_study(pooled3, 0.8, 12, "none") -> fs7a #MHAS
+km_by_study(pooled1, 0.8, 12, "none") -> fs7b #HRS
+km_by_study(pooled5, 0.5, 8, "none") -> fs7c #CHARLS
+km_by_study(pooled2, 0.5, 8, "none") -> fs7d #ELSA
+km_by_study(pooled4, 0.5, 4, "none", 1) -> fs7e #CRELES
 
 FigS7 <- ggarrange(
   nrow=2, heights = c(1.2,1),
@@ -2040,24 +3253,28 @@ ggsave(FigS7, file="Figures/FigureS7.jpg", bg="transparent", #1500x750pix
 #Fig 4: Overall KM + Cox---- ####
 cox.accel1 <- function(x){
   i <- as.numeric(deparse(substitute(x)) %>% substr(7,7))
+  x$TTDM <- pmin(x$TTDM, 120)  #Censor at 10 years
+  x$mortstat2 <- ifelse(x$TTDM>120, 0, x$mortstat2) 
   if(i>0){
-    coxph(Surv(TTDM, mortstat2) ~ accel + Age + comorb_cat +
+    coxph(Surv(TTDM, mortstat2) ~ accel + Age +
             strata(Sex) + strata(coh) + strata(Ethnicity2),
           weights = std_weights, data = x)}
   else {
-    coxph(Surv(TTDM, mortstat2) ~ accel + Age + comorb_cat +
+    coxph(Surv(TTDM, mortstat2) ~ accel + Age +
             strata(Sex) + strata(coh) + strata(Ethnicity2) +
             frailty(G2ASTUDY), weights = std_weights, data = x)}}
 cox.accel2 <- function(x){
   i <- as.numeric(deparse(substitute(x)) %>% substr(7,7))
+  x$TTDM <- pmin(x$TTDM, 120)  #Censor at 10 years
+  x$mortstat2 <- ifelse(x$TTDM>120, 0, x$mortstat2) 
   if(i>0){
-    coxph(Surv(TTDM, mortstat2) ~ accel + Age + comorb_cat +
-             Education + Smoking + Drinking +
+    coxph(Surv(TTDM, mortstat2) ~ accel + Age +
+            n_comorb + Education + Smoking + Drinking +
             strata(Sex) + strata(coh) + strata(Ethnicity2),
           weights = std_weights, data = x)}
   else {
-    coxph(Surv(TTDM, mortstat2) ~ accel + Age + comorb_cat +
-            Education + Smoking + Drinking +
+    coxph(Surv(TTDM, mortstat2) ~ accel + Age +
+            n_comorb + Education + Smoking + Drinking +
             strata(Sex) + strata(coh) + strata(Ethnicity2) +
             frailty(G2ASTUDY), weights = std_weights, data = x)}}
 
@@ -2092,9 +3309,19 @@ ann_f2 <- data.frame(
   ann_f2$upper[i] <- exp(confint(models[[i]])[1,2]) %>% round(2)
   ann_f2$G2ASTUDY[i] <- studies[i]}
 
+#Full adjustments (text)
+rbind((mBS0 %>% summary)$conf.int[1,c(1,3:4)],
+      (mBS1 %>% summary)$conf.int[1,c(1,3:4)],
+      (mBS2 %>% summary)$conf.int[1,c(1,3:4)],
+      (mBS3 %>% summary)$conf.int[1,c(1,3:4)],
+      (mBS4 %>% summary)$conf.int[1,c(1,3:4)],
+      (mBS5 %>% summary)$conf.int[1,c(1,3:4)]) %>%
+  round(2) %>% as.data.frame %>% `names<-`(LETTERS[1:3]) %>% 
+  transmute(HR=paste0("(HR ",A," [",B,"-",C,"])"))
+
 rbind(ann_f1, ann_f2) %>%
   mutate("Adjustments"=ordered(Adj,1:2,c(
-    "Age + multimorbidity", "+ education + lifestyle")),
+    "Age", "+ comorbidities + education + lifestyle")),
     "G2ASTUDY"=ordered(G2ASTUDY, levels=studies),
     "lab1"=trunc(estimate*100)/100,
     "lab2"=ifelse(Adj==1,prettyNum(events,big.mark=","), NA)) %>%
@@ -2102,8 +3329,8 @@ rbind(ann_f1, ann_f2) %>%
   geom_pointrange(aes(size=events, ymin=lower, ymax=upper), shape=15) +
   scale_size_continuous(guide = "none", range = c(0.5, 1)) +
   facet_wrap(~G2ASTUDY, nrow=2) + scale_y_log10()+ 
-  labs(x = "", y = "Adjusted HR (95%CI) for accelerated aging",
-       title = "Accelerated aging and all-cause mortality") +
+  labs(x = "", y = "Accelerated aging adjusted HR (95% CI)",
+       title = "All-cause mortality risk") +
   geom_hline(yintercept = 1, lty = "dashed") + theme_pubclean() +
   theme(legend.position = "bottom") +
   scale_color_manual(values = c("#6C4CA9","#35034F")) +
@@ -2116,7 +3343,7 @@ rbind(ann_f1, ann_f2) %>%
         strip.background = element_blank(), axis.text.x = element_blank(),
         axis.ticks.x = element_blank()) -> fig4b; fig4b
 
-fig4<-ggarrange(fig4a[[1]], fig4b, labels = LETTERS[1:2])
+fig4<-ggarrange(fig4b, fig4a[[1]], labels = LETTERS[1:2])
 ggsave(fig4,file="Figures/Figure4.jpg", bg="transparent",
        width=35, height=15, units=c("cm"), dpi=600, limitsize = FALSE)
 
@@ -2229,109 +3456,83 @@ ggsave(fs8,file="Figures/FigureS8.jpg", bg="transparent",
 
 
 
-#STab3: Cox cluster(ID)----- ####
+#STab10: Cox cluster(ID)---- ####
+#Modify dataset to exclude duplicated deaths per wave
+G2A_mega0_1<-rbind(
+  G2A_mega0 %>% filter(mortstat2==0),
+  G2A_mega0 %>% filter(mortstat2==1) %>% group_by(ID) %>%
+    filter(!(year==max(year))) %>%  ungroup() %>% mutate(mortstat2=0),
+  G2A_mega0 %>% filter(mortstat2==1) %>% group_by(ID) %>%
+    filter((year==max(year)))%>% ungroup())
+
+G2A_mega1_1 <- G2A_mega0_1 %>% filter(G2ASTUDY=="HRS")
+G2A_mega2_1 <- G2A_mega0_1 %>% filter(G2ASTUDY=="ELSA")
+G2A_mega3_1 <- G2A_mega0_1 %>% filter(G2ASTUDY=="MHAS")
+G2A_mega4_1 <- G2A_mega0_1 %>% filter(G2ASTUDY=="CRELES")
+G2A_mega5_1 <- G2A_mega0_1 %>% filter(G2ASTUDY=="CHARLS")
+
 #AnthropoAgeAccel Q1 vs Q2, Q3 and Q4
-cox.Q <- function(x,y=0, adj=1){
-  G2A_mega0 = G2A_mega
-  x = deparse(substitute(G2A_mega)); z = get(paste0(x,y))
+cox.Q <- function(x, adj=1){
   if(adj==1){
     output = coxph(
-      Surv(TTDM, mortstat2) ~ accelQ4 + Age + comorb_cat +
+      Surv(TTDM, mortstat2) ~ accelQ4 + Age +
         strata(Sex) + strata(Ethnicity2) + strata(coh) +
-        cluster(ID), weights=std_weights, data=z)
+        cluster(ID), weights=std_weights, data=x)
     return(output)
   }
   else if (adj==2){
     output = coxph(
-      Surv(TTDM, mortstat2) ~ accelQ4 + Age + comorb_cat +
-        Education + Smoking + Drinking +
+      Surv(TTDM, mortstat2) ~ accelQ4 + Age +
+        n_comorb + Education + Smoking + Drinking +
         strata(Sex) + strata(Ethnicity2) + strata(coh) +
-        cluster(ID), weights=std_weights, data=z)
+        cluster(ID), weights=std_weights, data=x)
     return(output)
   }
   else {
     return("Error: adjustment should be 1 or 2")}}
-cQ0.1 <- cox.Q(G2A_mega, 0, 1); cQ0.2 <- cox.Q(G2A_mega, 0, 2)
-cQ1.1 <- cox.Q(G2A_mega, 1, 1); cQ1.2 <- cox.Q(G2A_mega, 1, 2)
-cQ2.1 <- cox.Q(G2A_mega, 2, 1); cQ2.2 <- cox.Q(G2A_mega, 2, 2)
-cQ3.1 <- cox.Q(G2A_mega, 3, 1); cQ3.2 <- cox.Q(G2A_mega, 3, 2)
-cQ4.1 <- cox.Q(G2A_mega, 4, 1); cQ4.2 <- cox.Q(G2A_mega, 4, 2)
-cQ5.1 <- cox.Q(G2A_mega, 5, 1); cQ5.2 <- cox.Q(G2A_mega, 5, 2)
+cQ0.1 <- cox.Q(G2A_mega0_1, 1); cQ0.2 <- cox.Q(G2A_mega0_1, 2)
+cQ1.1 <- cox.Q(G2A_mega1_1, 1); cQ1.2 <- cox.Q(G2A_mega1_1, 2)
+cQ2.1 <- cox.Q(G2A_mega2_1, 1); cQ2.2 <- cox.Q(G2A_mega2_1, 2)
+cQ3.1 <- cox.Q(G2A_mega3_1, 1); cQ3.2 <- cox.Q(G2A_mega3_1, 2)
+cQ4.1 <- cox.Q(G2A_mega4_1, 1); cQ4.2 <- cox.Q(G2A_mega4_1, 2)
+cQ5.1 <- cox.Q(G2A_mega5_1, 1); cQ5.2 <- cox.Q(G2A_mega5_1, 2)
 
 #AnthropoAgeAccel >0
-cox.A <- function(x,y=0, adj=1){
-  G2A_mega0 = G2A_mega
-  x = deparse(substitute(G2A_mega)); z = get(paste0(x,y))
+cox.A <- function(x, adj=1){
   if(adj==1){
     output = coxph(
-      Surv(TTDM, mortstat2) ~ accel + Age + comorb_cat +
+      Surv(TTDM, mortstat2) ~ accel + Age +
         strata(Sex) + strata(Ethnicity2) + strata(coh) +
-        cluster(ID), weights=std_weights, data=z)
+        cluster(ID), weights=std_weights, data=x)
     return(output)
   }
   else if (adj==2){
     output = coxph(
-      Surv(TTDM, mortstat2) ~ accel + Age + comorb_cat +
-        Education + Smoking + Drinking +
+      Surv(TTDM, mortstat2) ~ accel + Age +
+        n_comorb + Education + Smoking + Drinking +
         strata(Sex) + strata(Ethnicity2) + strata(coh) +
-        cluster(ID), weights=std_weights, data=z)
+        cluster(ID), weights=std_weights, data=x)
     return(output)
   }
   else {
     return("Error: adjustment should be 1 or 2")}}
-cA0.1 <- cox.A(G2A_mega, 0, 1); cA0.2 <- cox.A(G2A_mega, 0, 2)
-cA1.1 <- cox.A(G2A_mega, 1, 1); cA1.2 <- cox.A(G2A_mega, 1, 2)
-cA2.1 <- cox.A(G2A_mega, 2, 1); cA2.2 <- cox.A(G2A_mega, 2, 2)
-cA3.1 <- cox.A(G2A_mega, 3, 1); cA3.2 <- cox.A(G2A_mega, 3, 2)
-cA4.1 <- cox.A(G2A_mega, 4, 1); cA4.2 <- cox.A(G2A_mega, 4, 2)
-cA5.1 <- cox.A(G2A_mega, 5, 1); cA5.2 <- cox.A(G2A_mega, 5, 2)
+cA0.1 <- cox.A(G2A_mega0_1, 1); cA0.2 <- cox.A(G2A_mega0_1, 2)
+cA1.1 <- cox.A(G2A_mega1_1, 1); cA1.2 <- cox.A(G2A_mega1_1, 2)
+cA2.1 <- cox.A(G2A_mega2_1, 1); cA2.2 <- cox.A(G2A_mega2_1, 2)
+cA3.1 <- cox.A(G2A_mega3_1, 1); cA3.2 <- cox.A(G2A_mega3_1, 2)
+cA4.1 <- cox.A(G2A_mega4_1, 1); cA4.2 <- cox.A(G2A_mega4_1, 2)
+cA5.1 <- cox.A(G2A_mega5_1, 1); cA5.2 <- cox.A(G2A_mega5_1, 2)
 
 #MHAS 2001
-cox.MQ <- function(x, y, adj=1){
-  if(adj==1){
-    output = coxph(
-      Surv(TTDM, mortstat2) ~ accelQ4 + Age + comorb_cat +
-        strata(Sex) + strata(Ethnicity2) + strata(coh) +
-        cluster(ID), weights=std_weights, data= x %>%
-        filter(wave==y, !duplicated(ID)))
-    return(output)
-  }
-  else if (adj==2){
-    output = coxph(
-      Surv(TTDM, mortstat2) ~ accelQ4 + Age + comorb_cat +
-        Education + Smoking + Drinking +
-        strata(Sex) + strata(Ethnicity2) + strata(coh) +
-        cluster(ID), weights=std_weights, data= x %>%
-        filter(wave==y, !duplicated(ID)))
-    return(output)
-  }
-  else {
-    return("Error: adjustment should be 1 or 2")}}
-cox.MA <- function(x, y, adj=1){
-  if(adj==1){
-    output = coxph(
-      Surv(TTDM, mortstat2) ~ accel + Age + comorb_cat +
-        strata(Sex) + strata(Ethnicity2) + strata(coh) +
-        cluster(ID), weights=std_weights, data= x %>%
-        filter(wave==y, !duplicated(ID)))
-    return(output)
-  }
-  else if (adj==2){
-    output = coxph(
-      Surv(TTDM, mortstat2) ~ accel + Age + comorb_cat +
-        Education + Smoking + Drinking +
-        strata(Sex) + strata(Ethnicity2) + strata(coh) +
-        cluster(ID), weights=std_weights, data= x %>%
-        filter(wave==y, !duplicated(ID)))
-    return(output)
-  }
-  else {
-    return("Error: adjustment should be 1 or 2")}}
-cQ3a.1 <- cox.MQ(G2A_mega3, 1, 1); cQ3a.2 <- cox.MQ(G2A_mega3, 1, 2)
-cA3a.1 <- cox.MA(G2A_mega3, 1, 1); cA3a.2 <- cox.MA(G2A_mega3, 1, 2)
+cQ3a.1 <- cox.Q(G2A_mega3_1 %>% filter(wave==1), 1)
+cQ3a.2 <- cox.Q(G2A_mega3_1 %>% filter(wave==1), 2)
+cA3a.1 <- cox.A(G2A_mega3_1 %>% filter(wave==1), 1)
+cA3a.2 <- cox.A(G2A_mega3_1 %>% filter(wave==1), 2)
 #MHAS 2012
-cQ3b.1 <- cox.MQ(G2A_mega3, 3, 1); cQ3b.2 <- cox.MQ(G2A_mega3, 3, 2)
-cA3b.1 <- cox.MA(G2A_mega3, 3, 1); cA3b.2 <- cox.MA(G2A_mega3, 3, 2)
+cQ3b.1 <- cox.Q(G2A_mega3_1 %>% filter(wave==3), 1)
+cQ3b.2 <- cox.Q(G2A_mega3_1 %>% filter(wave==3), 2)
+cA3b.1 <- cox.A(G2A_mega3_1 %>% filter(wave==3), 1)
+cA3b.2 <- cox.A(G2A_mega3_1 %>% filter(wave==3), 2)
 
 #Create table
 getHR_ <- function(x){
@@ -2353,17 +3554,13 @@ getHR_ <- function(x){
                                  C=sprintf(fmt="%#.2f", C)) %>%
       transmute("HR.CI"=paste0(A," (",B,"-",C,")"))
     return(out2 %>% `row.names<-`(NULL))}}
-studies1 <- c("Overall","HRS","ELSA"," Overall",
-              "2001", "2012", "CRELES","CHARLS")
-
+studies1 <- c("Overall","HRS","ELSA"," MHAS", "CRELES","CHARLS")
 rbind(
   c("","","",""),
   t(rbind(getHR_(cQ0.1), getHR_(cA0.1))),
   t(rbind(getHR_(cQ1.1), getHR_(cA1.1))),
   t(rbind(getHR_(cQ2.1), getHR_(cA2.1))),
   t(rbind(getHR_(cQ3.1), getHR_(cA3.1))),
-  t(rbind(getHR_(cQ3a.1), getHR_(cA3a.1))),
-  t(rbind(getHR_(cQ3b.1), getHR_(cA3b.1))),
   t(rbind(getHR_(cQ4.1), getHR_(cA4.1))),
   t(rbind(getHR_(cQ5.1), getHR_(cA5.1))),
   c("","","",""),
@@ -2371,27 +3568,19 @@ rbind(
   t(rbind(getHR_(cQ1.2), getHR_(cA1.2))),
   t(rbind(getHR_(cQ2.2), getHR_(cA2.2))),
   t(rbind(getHR_(cQ3.2), getHR_(cA3.2))),
-  t(rbind(getHR_(cQ3a.2), getHR_(cA3a.2))),
-  t(rbind(getHR_(cQ3b.2), getHR_(cA3b.2))),
   t(rbind(getHR_(cQ4.2), getHR_(cA4.2))),
   t(rbind(getHR_(cQ5.2), getHR_(cA5.2)))) %>% as.data.frame() %>%
   `colnames<-`(c("Q2 vs Q1","Q3 vs Q1","Q4 vs Q1","Accelerated\naging")) %>%
   `rownames<-`(c("", studies1, " ", paste0(studies1," "))
   ) -> tab_S3
-rep("",3)
 
 cbind(" "=c(
-  "Adjustments 1: CA, comorbidities",studies[1:3],
-  c(rep("MHAS",3),studies[1:2]),
-  "Adjustments 2: + education, lifestyle",studies[1:3],
-  c(rep("MHAS",3),studies[1:2])),
-  tab_S3 %>% rownames_to_column("Study")) %>% flextable %>%
-  merge_at(i=1, j=1:6) %>% merge_at(i=10, j=1:6) %>% merge_at(i=2, j=1:2) %>%
-  merge_at(i=3, j=1:2) %>% merge_at(i=4, j=1:2) %>% merge_at(i=8, j=1:2) %>%
-  merge_at(i=9, j=1:2) %>% merge_at(i=11, j=1:2) %>% merge_at(i=12, j=1:2)%>% 
-  merge_at(i=13, j=1:2) %>% merge_at(i=17, j=1:2) %>%  merge_at(i=18, j=1:2)%>%
-  bold(part = "header") %>% bold(i=c(1,10), j=1:6) %>% bold(i=1:18, j=1) %>% 
-  italic(i=c(1,10), j=1:6) %>% italic(i=c(5:7, 14:16), j=2) %>%
+  "Adjustments 1: CA, comorbidities",studies[1:6],
+  "Adjustments 2: + education, lifestyle",studies[1:6]),
+  tab_S3) %>% flextable %>%
+  merge_at(i=1, j=1:5) %>% merge_at(i=8, j=1:5) %>% 
+  bold(part = "header") %>% bold(i=c(1,8), j=1:5) %>% bold(i=1:14, j=1) %>% 
+  italic(i=c(1,10), j=1:5) %>%
   align(align="center", part="all") %>% autofit() -> tabs3
 
 set_flextable_defaults(
@@ -2412,6 +3601,7 @@ cox.zph.tab %>% t %>% `rownames<-`(models) %>% data.frame() %>%
          "Adj"=rep(c(rep("Simple",6), rep("Full",6)), 2),
          "Out"=c(rep("AccelQ4",12), rep("Accel",12))) %>% 
   arrange((GLOBAL)) %>% mutate("PR"=GLOBAL>(0.05))
+
 
 #Visualize: AnthropoAgeAccel quartiles
 plotlist <- list(); for(i in 1:6){
@@ -2434,6 +3624,7 @@ plotlist <- list(); for(i in 1:6){
   plotlist = append(plotlist, pnew)}
 ggarrange(plotlist[[1]], plotlist[[2]], plotlist[[3]], plotlist[[4]],
           plotlist[[5]], plotlist[[6]], nrow=2, ncol=3)
+
 
 ####-------------------------------- FUNC/HEALTH DECLINE ----------#### ----####
 #Correlation structures---------- ####
@@ -2481,7 +3672,7 @@ G2A_mega5 %>%transmute(ID,V=n_comorb,year) %>% see.corrstr
 #New data frame
 G2A_SRH <- G2A_mega %>% mutate("Out"=as.numeric(SRH)) %>% filter(Out>=0) %>%
   select(ID, year, std_weights, Out, TTDY, AnthropoAgeAccel, Age, Sex,
-         Ethnicity3, coh, Education, Smoking, Drinking) %>% na.omit
+         Ethnicity3, coh, Education, Smoking, Drinking, ABSI) %>% na.omit
 
 #GEE models with Poisson variance function
 gee.SRH0 <- geeglm( #Without AnthropoAgeAccel
@@ -2491,6 +3682,11 @@ gee.SRH0 <- geeglm( #Without AnthropoAgeAccel
   family="poisson", weights=std_weights, data=G2A_SRH)
 gee.SRH1 <- geeglm( #AnthropoAgeAccel
   Out ~ scale(AnthropoAgeAccel) + Age + Sex + Ethnicity3 +
+    coh + Education + Smoking + Drinking, offset=log(TTDY+1),
+  id=ID, wave=year, std.err="san.se", corstr = "ar1",
+  family="poisson", weights=std_weights, data=G2A_SRH)
+gee.SRH1. <- geeglm( #ABSI
+  Out ~ scale(ABSI) + Age + Sex + Ethnicity3 +
     coh + Education + Smoking + Drinking, offset=log(TTDY+1),
   id=ID, wave=year, std.err="san.se", corstr = "ar1",
   family="poisson", weights=std_weights, data=G2A_SRH)
@@ -2505,7 +3701,8 @@ gee.SRH3 <- geeglm( #AnthropoAgeAccel*Age
   id=ID, wave=year, std.err="san.se", corstr = "ar1",
   family="poisson", weights=std_weights, data=G2A_SRH)
 #QIC comparison
-QIC.SRH <- QIC(gee.SRH1)-QIC(gee.SRH0)#SRH
+QIC.SRH <- QIC(gee.SRH1)-QIC(gee.SRH0)#AAA
+QIC.SRH. <- QIC(gee.SRH1.)-QIC(gee.SRH0)#ABSI
 #At risk and incident cases
 risk.SRH <- nrow(G2A_SRH %>% filter(!duplicated(ID)))
 
@@ -2517,7 +3714,7 @@ ids_ADL <- (pooled %>% filter(ADL>=1))$ID
 G2A_ADL <- G2A_mega %>% filter(!(ID %in% ids_ADL)) %>%
   mutate("Out"=as.numeric(ADL)) %>% filter(Out>=0) %>%
   select(ID, year, std_weights, Out, TTDY, AnthropoAgeAccel, Age, Sex,
-         Ethnicity3, coh, Education, Smoking, Drinking) %>% na.omit
+         Ethnicity3, coh, Education, Smoking, Drinking, ABSI) %>% na.omit
 
 #GEE models with Poisson variance function
 gee.ADL0 <- geeglm( #Without AnthropoAgeAccel
@@ -2527,6 +3724,11 @@ gee.ADL0 <- geeglm( #Without AnthropoAgeAccel
   family="poisson", weights=std_weights, data=G2A_ADL)
 gee.ADL1 <- geeglm( #AnthropoAgeAccel
   Out ~ scale(AnthropoAgeAccel) + Age + Sex + Ethnicity3 +
+    coh + Education + Smoking + Drinking, offset=log(TTDY+1),
+  id=ID, wave=year, std.err="san.se", corstr = "ar1",
+  family="poisson", weights=std_weights, data=G2A_ADL)
+gee.ADL1. <- geeglm( #ABSI
+  Out ~ scale(ABSI) + Age + Sex + Ethnicity3 +
     coh + Education + Smoking + Drinking, offset=log(TTDY+1),
   id=ID, wave=year, std.err="san.se", corstr = "ar1",
   family="poisson", weights=std_weights, data=G2A_ADL)
@@ -2541,7 +3743,8 @@ gee.ADL3 <- geeglm( #AnthropoAgeAccel*Age
   id=ID, wave=year, std.err="san.se", corstr = "ar1",
   family="poisson", weights=std_weights, data=G2A_ADL)
 #QIC comparison
-QIC.ADL <- QIC(gee.ADL1)-QIC(gee.ADL0)#ADL
+QIC.ADL <- QIC(gee.ADL1)-QIC(gee.ADL0)#AAA
+QIC.ADL. <- QIC(gee.ADL1.)-QIC(gee.ADL0)#ABSI
 #At risk and incident cases
 risk.ADL <- table(G2A_ADL$ID) %>% length
 case.ADL <- sum(table(G2A_ADL$ID, G2A_ADL$Out>0)[,2]>0)
@@ -2553,7 +3756,7 @@ ids_IAD <- (pooled %>% filter(IADL>=1))$ID
 G2A_IAD <- G2A_mega %>% filter(!(ID %in% ids_IAD)) %>%
   mutate("Out"=as.numeric(IADL)) %>% filter(Out>=0) %>%
   select(ID, year, std_weights, Out, TTDY, AnthropoAgeAccel, Age, Sex,
-         Ethnicity3, coh, Education, Smoking, Drinking) %>% na.omit
+         Ethnicity3, coh, Education, Smoking, Drinking, ABSI) %>% na.omit
 
 #GEE models with Poisson variance function
 gee.IAD0 <- geeglm( #Without AnthropoAgeAccel
@@ -2563,6 +3766,11 @@ gee.IAD0 <- geeglm( #Without AnthropoAgeAccel
   family="poisson", weights=std_weights, data=G2A_IAD)
 gee.IAD1 <- geeglm( #AnthropoAgeAccel
   Out ~ scale(AnthropoAgeAccel) + Age + Sex + Ethnicity3 +
+    coh + Education + Smoking + Drinking, offset=log(TTDY+1),
+  id=ID, wave=year, std.err="san.se", corstr = "ar1",
+  family="poisson", weights=std_weights, data=G2A_IAD)
+gee.IAD1. <- geeglm( #ABSI
+  Out ~ scale(ABSI) + Age + Sex + Ethnicity3 +
     coh + Education + Smoking + Drinking, offset=log(TTDY+1),
   id=ID, wave=year, std.err="san.se", corstr = "ar1",
   family="poisson", weights=std_weights, data=G2A_IAD)
@@ -2577,7 +3785,8 @@ gee.IAD3 <- geeglm( #AnthropoAgeAccel*Age
   id=ID, wave=year, std.err="san.se", corstr = "ar1",
   family="poisson", weights=std_weights, data=G2A_IAD)
 #QIC comparison
-QIC.IAD <- QIC(gee.IAD1)-QIC(gee.IAD0)#IAD
+QIC.IAD <- QIC(gee.IAD1)-QIC(gee.IAD0)#AAA
+QIC.IAD. <- QIC(gee.IAD1.)-QIC(gee.IAD0)#ABSI
 #At risk and incident cases
 risk.IAD <- table(G2A_IAD$ID) %>% length
 case.IAD <- sum(table(G2A_IAD$ID, G2A_IAD$Out>0)[,2]>0)
@@ -2590,7 +3799,7 @@ ids_T2D <- (pooled %>% filter(T2D==1))$ID
 G2A_T2D <- G2A_mega %>% filter(!(ID %in% ids_T2D)) %>%
   mutate("Out"=as.numeric(T2D)) %>% filter(Out>=0) %>%
   select(ID, year, std_weights, Out, TTDY, AnthropoAgeAccel, Age, Sex,
-         Ethnicity3, coh, Education, Smoking, Drinking) %>% na.omit
+         Ethnicity3, coh, Education, Smoking, Drinking, ABSI) %>% na.omit
 
 #GEE models with Poisson variance function
 gee.T2D0 <- geeglm( #Without AnthropoAgeAccel
@@ -2600,6 +3809,11 @@ gee.T2D0 <- geeglm( #Without AnthropoAgeAccel
   family="poisson", weights=std_weights, data=G2A_T2D)
 gee.T2D1 <- geeglm( #AnthropoAgeAccel
   Out ~ scale(AnthropoAgeAccel) + Age + Sex + Ethnicity3 +
+    coh + Education + Smoking + Drinking, offset=log(TTDY+1),
+  id=ID, wave=year, std.err="san.se", corstr = "ar1",
+  family="poisson", weights=std_weights, data=G2A_T2D)
+gee.T2D1. <- geeglm( #ABSI
+  Out ~ scale(ABSI) + Age + Sex + Ethnicity3 +
     coh + Education + Smoking + Drinking, offset=log(TTDY+1),
   id=ID, wave=year, std.err="san.se", corstr = "ar1",
   family="poisson", weights=std_weights, data=G2A_T2D)
@@ -2615,6 +3829,7 @@ gee.T2D3 <- geeglm( #AnthropoAgeAccel*Age
   family="poisson", weights=std_weights, data=G2A_T2D)
 #QIC comparison
 QIC.T2D <- QIC(gee.T2D1)-QIC(gee.T2D0)#T2D
+QIC.T2D. <- QIC(gee.T2D1.)-QIC(gee.T2D0)#T2D
 #At risk and incident cases
 risk.T2D <- table(G2A_T2D$ID) %>% length
 case.T2D <- sum(table(G2A_T2D$ID, G2A_T2D$Out>0)[,2]>0)
@@ -2626,7 +3841,7 @@ ids_HBP <- (pooled %>% filter(HBP>=1))$ID
 G2A_HBP <- G2A_mega %>% filter(!(ID %in% ids_HBP)) %>%
   mutate("Out"=as.numeric(HBP)) %>% filter(Out>=0) %>%
   select(ID, year, std_weights, Out, TTDY, AnthropoAgeAccel, Age, Sex,
-         Ethnicity3, coh, Education, Smoking, Drinking) %>% na.omit
+         Ethnicity3, coh, Education, Smoking, Drinking, ABSI) %>% na.omit
 
 #GEE models with Poisson variance function
 gee.HBP0 <- geeglm( #Without AnthropoAgeAccel
@@ -2636,6 +3851,11 @@ gee.HBP0 <- geeglm( #Without AnthropoAgeAccel
   family="poisson", weights=std_weights, data=G2A_HBP)
 gee.HBP1 <- geeglm( #AnthropoAgeAccel
   Out ~ scale(AnthropoAgeAccel) + Age + Sex + Ethnicity3 +
+    coh + Education + Smoking + Drinking, offset=log(TTDY+1),
+  id=ID, wave=year, std.err="san.se", corstr = "ar1",
+  family="poisson", weights=std_weights, data=G2A_HBP)
+gee.HBP1. <- geeglm( #ABSI
+  Out ~ scale(ABSI) + Age + Sex + Ethnicity3 +
     coh + Education + Smoking + Drinking, offset=log(TTDY+1),
   id=ID, wave=year, std.err="san.se", corstr = "ar1",
   family="poisson", weights=std_weights, data=G2A_HBP)
@@ -2650,7 +3870,8 @@ gee.HBP3 <- geeglm( #AnthropoAgeAccel*Age
   id=ID, wave=year, std.err="san.se", corstr = "ar1",
   family="poisson", weights=std_weights, data=G2A_HBP)
 #QIC comparison
-QIC.HBP <- QIC(gee.HBP1)-QIC(gee.HBP0)#HBP
+QIC.HBP <- QIC(gee.HBP1)-QIC(gee.HBP0)#AAA
+QIC.HBP. <- QIC(gee.HBP1.)-QIC(gee.HBP0)#ABSI
 #At risk and incident cases
 risk.HBP <- table(G2A_HBP$ID) %>% length
 case.HBP <- sum(table(G2A_HBP$ID, G2A_HBP$Out>0)[,2]>0)
@@ -2662,7 +3883,7 @@ ids_CAN <- (pooled %>% filter(CAN>=1))$ID
 G2A_CAN <- G2A_mega %>% filter(!(ID %in% ids_CAN)) %>%
   mutate("Out"=as.numeric(CAN)) %>% filter(Out>=0) %>%
   select(ID, year, std_weights, Out, TTDY, AnthropoAgeAccel, Age, Sex,
-         Ethnicity3, coh, Education, Smoking, Drinking) %>% na.omit
+         Ethnicity3, coh, Education, Smoking, Drinking, ABSI) %>% na.omit
 
 #GEE models with Poisson variance function
 gee.CAN0 <- geeglm( #Without AnthropoAgeAccel
@@ -2672,6 +3893,11 @@ gee.CAN0 <- geeglm( #Without AnthropoAgeAccel
   family="poisson", weights=std_weights, data=G2A_CAN)
 gee.CAN1 <- geeglm( #AnthropoAgeAccel
   Out ~ scale(AnthropoAgeAccel) + Age + Sex + Ethnicity3 +
+    coh + Education + Smoking + Drinking, offset=log(TTDY+1),
+  id=ID, wave=year, std.err="san.se", corstr = "ar1",
+  family="poisson", weights=std_weights, data=G2A_CAN)
+gee.CAN1. <- geeglm( #ABSI
+  Out ~ scale(ABSI) + Age + Sex + Ethnicity3 +
     coh + Education + Smoking + Drinking, offset=log(TTDY+1),
   id=ID, wave=year, std.err="san.se", corstr = "ar1",
   family="poisson", weights=std_weights, data=G2A_CAN)
@@ -2687,6 +3913,7 @@ gee.CAN3 <- geeglm( #AnthropoAgeAccel*Age
   family="poisson", weights=std_weights, data=G2A_CAN)
 #QIC comparison
 QIC.CAN <- QIC(gee.CAN1)-QIC(gee.CAN0)#CAN
+QIC.CAN. <- QIC(gee.CAN1.)-QIC(gee.CAN0)#CAN
 #At risk and incident cases
 risk.CAN <- table(G2A_CAN$ID) %>% length
 case.CAN <- sum(table(G2A_CAN$ID, G2A_CAN$Out>0)[,2]>0)
@@ -2698,7 +3925,7 @@ ids_LUD <- (pooled %>% filter(LUD>=1))$ID
 G2A_LUD <- G2A_mega %>% filter(!(ID %in% ids_LUD)) %>%
   mutate("Out"=as.numeric(LUD)) %>% filter(Out>=0) %>%
   select(ID, year, std_weights, Out, TTDY, AnthropoAgeAccel, Age, Sex,
-         Ethnicity3, coh, Education, Smoking, Drinking) %>% na.omit
+         Ethnicity3, coh, Education, Smoking, Drinking, ABSI) %>% na.omit
 
 #GEE models with Poisson variance function
 gee.LUD0 <- geeglm( #Without AnthropoAgeAccel
@@ -2708,6 +3935,11 @@ gee.LUD0 <- geeglm( #Without AnthropoAgeAccel
   family="poisson", weights=std_weights, data=G2A_LUD)
 gee.LUD1 <- geeglm( #AnthropoAgeAccel
   Out ~ scale(AnthropoAgeAccel) + Age + Sex + Ethnicity3 +
+    coh + Education + Smoking + Drinking, offset=log(TTDY+1),
+  id=ID, wave=year, std.err="san.se", corstr = "ar1",
+  family="poisson", weights=std_weights, data=G2A_LUD)
+gee.LUD1. <- geeglm( #ABSI
+  Out ~ scale(ABSI) + Age + Sex + Ethnicity3 +
     coh + Education + Smoking + Drinking, offset=log(TTDY+1),
   id=ID, wave=year, std.err="san.se", corstr = "ar1",
   family="poisson", weights=std_weights, data=G2A_LUD)
@@ -2723,6 +3955,7 @@ gee.LUD3 <- geeglm( #AnthropoAgeAccel*Age
   family="poisson", weights=std_weights, data=G2A_LUD)
 #QIC comparison
 QIC.LUD <- QIC(gee.LUD1)-QIC(gee.LUD0)#LUD
+QIC.LUD. <- QIC(gee.LUD1.)-QIC(gee.LUD0)#LUD
 #At risk and incident cases
 risk.LUD <- table(G2A_LUD$ID) %>% length
 case.LUD <- sum(table(G2A_LUD$ID, G2A_LUD$Out>0)[,2]>0)
@@ -2734,7 +3967,7 @@ ids_AMI <- (pooled %>% filter(AMI>=1))$ID
 G2A_AMI <- G2A_mega %>% filter(!(ID %in% ids_AMI)) %>%
   mutate("Out"=as.numeric(AMI)) %>% filter(Out>=0) %>%
   select(ID, year, std_weights, Out, TTDY, AnthropoAgeAccel, Age, Sex,
-         Ethnicity3, coh, Education, Smoking, Drinking) %>% na.omit
+         Ethnicity3, coh, Education, Smoking, Drinking, ABSI) %>% na.omit
 
 #GEE models with Poisson variance function
 gee.AMI0 <- geeglm( #Without AnthropoAgeAccel
@@ -2744,6 +3977,11 @@ gee.AMI0 <- geeglm( #Without AnthropoAgeAccel
   family="poisson", weights=std_weights, data=G2A_AMI)
 gee.AMI1 <- geeglm( #AnthropoAgeAccel
   Out ~ scale(AnthropoAgeAccel) + Age + Sex + Ethnicity3 +
+    coh + Education + Smoking + Drinking, offset=log(TTDY+1),
+  id=ID, wave=year, std.err="san.se", corstr = "ar1",
+  family="poisson", weights=std_weights, data=G2A_AMI)
+gee.AMI1. <- geeglm( #ABSI
+  Out ~ scale(ABSI) + Age + Sex + Ethnicity3 +
     coh + Education + Smoking + Drinking, offset=log(TTDY+1),
   id=ID, wave=year, std.err="san.se", corstr = "ar1",
   family="poisson", weights=std_weights, data=G2A_AMI)
@@ -2758,10 +3996,13 @@ gee.AMI3 <- geeglm( #AnthropoAgeAccel*Age
   id=ID, wave=year, std.err="san.se", corstr = "ar1",
   family="poisson", weights=std_weights, data=G2A_AMI)
 #QIC comparison
-QIC.AMI <- QIC(gee.AMI1)-QIC(gee.AMI0)#AMI
+QIC.AMI <- QIC(gee.AMI1)-QIC(gee.AMI0)#AAA
+QIC.AMI. <- QIC(gee.AMI1.)-QIC(gee.AMI0)#ABSI
 #At risk and incident cases
 risk.AMI <- table(G2A_AMI$ID) %>% length
 case.AMI <- sum(table(G2A_AMI$ID, G2A_AMI$Out>0)[,2]>0)
+
+(gee.AMI3 %>% confint %>% exp)[22,]
 
 
 ###________________________________ EVC ________________________________###
@@ -2770,7 +4011,7 @@ ids_EVC <- (pooled %>% filter(EVC>=1))$ID
 G2A_EVC <- G2A_mega %>% filter(!(ID %in% ids_EVC)) %>%
   mutate("Out"=as.numeric(EVC)) %>% filter(Out>=0) %>%
   select(ID, year, std_weights, Out, TTDY, AnthropoAgeAccel, Age, Sex,
-         Ethnicity3, coh, Education, Smoking, Drinking) %>% na.omit
+         Ethnicity3, coh, Education, Smoking, Drinking, ABSI) %>% na.omit
 
 #GEE models with Poisson variance function
 gee.EVC0 <- geeglm( #Without AnthropoAgeAccel
@@ -2780,6 +4021,11 @@ gee.EVC0 <- geeglm( #Without AnthropoAgeAccel
   family="poisson", weights=std_weights, data=G2A_EVC)
 gee.EVC1 <- geeglm( #AnthropoAgeAccel
   Out ~ scale(AnthropoAgeAccel) + Age + Sex + Ethnicity3 +
+    coh + Education + Smoking + Drinking, offset=log(TTDY+1),
+  id=ID, wave=year, std.err="san.se", corstr = "ar1",
+  family="poisson", weights=std_weights, data=G2A_EVC)
+gee.EVC1. <- geeglm( #ABSI
+  Out ~ scale(ABSI) + Age + Sex + Ethnicity3 +
     coh + Education + Smoking + Drinking, offset=log(TTDY+1),
   id=ID, wave=year, std.err="san.se", corstr = "ar1",
   family="poisson", weights=std_weights, data=G2A_EVC)
@@ -2795,13 +4041,14 @@ gee.EVC3 <- geeglm( #AnthropoAgeAccel*Age
   family="poisson", weights=std_weights, data=G2A_EVC)
 #QIC comparison
 QIC.EVC <- QIC(gee.EVC1)-QIC(gee.EVC0)#EVC
+QIC.EVC. <- QIC(gee.EVC1.)-QIC(gee.EVC0)#EVC
 #At risk and incident cases
 risk.EVC <- table(G2A_EVC$ID) %>% length
 case.EVC <- sum(table(G2A_EVC$ID, G2A_EVC$Out>0)[,2]>0)
 
 
 
-#Tab 1: Functional/health decline ####
+#Tab 2: Functional/health decline ####
 getRR_gee <- function(x, y){
   if(y%in%1:2){
     a <- summary(x)$coefficients[2,][1] %>% as.numeric
@@ -2812,13 +4059,14 @@ getRR_gee <- function(x, y){
     b <- summary(x)$coefficients[z,][2] %>% as.numeric}
   c <- a %>% exp %>% sprintf(fmt="%#.3f")
   d <- (a + c(-1,1)*qnorm(.975)*b) %>% exp %>% sprintf(fmt="%#.3f")
-  e <- paste0(c, " (", d[1], "-", d[2],")")
+  e <- paste0(c, "\n(", d[1], "-", d[2],")")
   e}
 
 outs <- c("SRH", "ADL", "IAD", "T2D", "HBP", "CAN", "LUD", "AMI", "EVC")
 at_risk <- as.list(paste0("risk.", outs)) %>% sapply(get)
 events <- c("-", as.list(paste0("case.", outs[-1])) %>% sapply(get))
 dQIC <- as.list(paste0("QIC.", outs)) %>% sapply(function(x){get(x)[1]})
+dQIC. <- as.list(paste0("QIC.",outs,".")) %>% sapply(function(x){get(x)[1]})
 RR1 <- as.list(paste0("gee.",outs,1)) %>% lapply(get) %>% sapply(getRR_gee,1)
 RR2 <- as.list(paste0("gee.",outs,2)) %>% lapply(get) %>% sapply(getRR_gee,2)
 RR3 <- as.list(paste0("gee.",outs,3)) %>% lapply(get) %>% sapply(getRR_gee,3)
@@ -2826,10 +4074,10 @@ names <- c("Change in self-\nreported health", paste0("New onset\n", c(
   "ADL deficit","IADL deficit","diabetes","hypertension","cancer diagnosis",
   "chronic lung disease", "myocardial infarction","stroke")))
 
-data.frame(names, at_risk, events, RR1, RR2, RR3, dQIC) %>% `colnames<-`(c(
+data.frame(names,at_risk,events,RR1,RR2,RR3,dQIC,dQIC.) %>% `colnames<-`(c(
   "Outcome", "Population at\nrisk (baseline)", "Events",
   "RR.AnthropoAgeAccel (1-SD)", "RR.AnthropoAgeAccel ≥0",
-  "RR.AnthropoAgeAccel*Age", "Delta QIC")) %>% flextable() %>% 
+  "RR.AnthropoAgeAccel*Age", "Delta QIC", "Delta QIC 2")) %>% flextable() %>% 
   separate_header(opts = c("span-top", "bottom-vspan", "center-hspan")) %>%
   bold(part="header") %>% italic(j=1, part="body") %>%
   align(align="center", part="all") -> tab4
@@ -2965,6 +4213,71 @@ studies <- c(
   
 ggsave(FigS9, file="Figures/FigureS9.jpg", bg="transparent",
        width=15, height=15, units=c("cm"), dpi=600, limitsize = FALSE)
+
+
+#SFig10: Comorbidity assessment-- ####
+pooled <- pooled %>% mutate(age_cat = Age %>% cut(c(-Inf,69, Inf))) %>%
+  mutate(age_cat=factor(age_cat, labels=c("<70y", "≥70y"))) %>%
+  mutate(comorb_cat2=cut(n_comorb, c(-Inf,0,1,2,3, Inf)) %>%
+           factor(labels=c("0","1","2","3", "≥4"))) %>%
+  mutate(SRH2=case_when(SRH>0~SRH) %>% ordered(labels=c(
+    "Excellent", "Very good", "Good", "Fair", "Poor")))
+
+s5a <- pooled %>% filter(!is.na(comorb_cat)) %>%
+  ggplot(aes(x=comorb_cat2, y=AnthropoAgeAccel, fill=comorb_cat2))+
+  geom_boxplot(outlier.alpha = 0)+ylim(-18,18)+ facet_wrap(~age_cat)+theme_bw()+
+  labs(fill="Number of comorbidities",x=NULL,title="Number of comorbidities")+
+  theme(legend.position="bottom")+
+  ggpubr::stat_compare_means(size=3.5, label.x.npc = 0.35, label.y.npc =0.85) +
+  theme(text = element_text(hjust=0.5)) +
+  scale_fill_manual(values=c("#69F0B6","#EBEF6A","#D49400","#A4394B","#752828"))+
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        plot.title=element_text(hjust=0.5, face="bold"))
+
+s5b <- pooled %>% filter(!is.na(comorb_cat)) %>% #filter(G2ASTUDY=="CHARLS") %>% 
+  group_by(age_cat, comorb_cat2, accel) %>% summarise(
+    Counts = n()) %>% mutate(freq = Counts / sum(Counts)) %>% as.data.frame%>%
+  mutate("accel2"=factor(accel,labels=c("Non-accelerated", "Accelerated"))) %>% 
+  ggplot(aes(y=freq, x=comorb_cat2, fill=(accel2))) +
+  geom_bar(stat="identity", position='fill', color="black")+
+  scale_fill_manual(values=c("#69F0B6", "#A4394B"))+
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0,1))+
+  labs(y="Frequency (%)",x=NULL, fill="AnthropoAgeAccel",
+       title="Number of comorbidities")+ facet_wrap(~age_cat)+
+  theme_bw()+ theme(legend.position="bottom",
+                    plot.title=element_text(hjust=0.5,face="bold")) +
+  geom_text(aes(label=ifelse(accel==1, round(freq*100,1), "")),
+            nudge_y = -0.05, color="white", size=3.5, fontface="bold")
+
+s5c <- pooled %>% filter(SRH>0) %>%
+  ggplot(aes(x=ordered(SRH2), y=AnthropoAgeAccel, fill=ordered(SRH2)))+
+  geom_boxplot(outlier.alpha = 0)+ylim(-18,18)+ facet_wrap(~age_cat)+theme_bw()+
+  labs(fill="Self-reported health", x=NULL, title="Self-reported health")+
+  theme(legend.position="bottom")+
+  ggpubr::stat_compare_means(size=3.5, label.x.npc = 0.35, label.y.npc =0.85) +
+  theme(text = element_text(hjust=0.5)) +
+  scale_fill_manual(values=c("#69F0B6","#EBEF6A","#D49400","#A4394B","#752828"))+
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        plot.title=element_text(hjust=0.5, face="bold"))
+
+s5d <- pooled %>% filter(SRH>0) %>% #filter(G2ASTUDY=="CHARLS") %>% 
+  group_by(age_cat, SRH2, accel) %>% summarise(
+    Counts = n()) %>% mutate(freq = Counts / sum(Counts)) %>% as.data.frame%>%
+  mutate("accel2"=factor(accel,labels=c("Non-accelerated", "Accelerated"))) %>% 
+  ggplot(aes(y=freq, x=SRH2, fill=(accel2))) +
+  geom_bar(stat="identity", position='fill', color="black")+
+  scale_fill_manual(values=c("#69F0B6", "#A4394B"))+
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0,1))+
+  labs(y="Frequency (%)",x=NULL, fill="AnthropoAgeAccel",
+       title="Self-reported health")+ facet_wrap(~age_cat)+
+  theme_bw()+ theme(legend.position="bottom",
+                    plot.title=element_text(hjust=0.5,face="bold")) +
+  geom_text(aes(label=ifelse(accel==1, round(freq*100,1), "")),
+            nudge_y = -0.05, color="white", size=3.5, fontface="bold")
+
+suppX<-ggarrange(s5a, s5c, s5b, s5d, ncol=2, nrow=2, labels=letters[1:4])
+ggsave(suppX, file="Figures/FigureS10.jpg", bg="transparent",
+       width=40, height=25, units=c("cm"), dpi=600, limitsize = FALSE)
 
 
 ####----DRAFTS-----------------------------------------------------#### ----####
